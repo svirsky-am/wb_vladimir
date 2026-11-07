@@ -33,12 +33,13 @@ class AppConfig:
 # Конфигурация
 #API_KEY = os.environ.get("API_TOKEN")
 # URL = "https://wildberries.ru"
-URL = "https://statistics-api.wildberries.ru/api/v1/supplier/orders"
+#URL = "https://statistics-api.wildberries.ru/api/v1/supplier/orders"
+URL_WORK_PING = "https://common-api.wildberries.ru/ping"
 
 
 
 
-def run_request(app_config: AppConfig):
+def run_work_ping_request(app_config: AppConfig):
     # Параметры запроса (период макс. до 30 дней за один запрос)
     params = {
         "dateFrom": "2026-10-01",
@@ -52,20 +53,48 @@ def run_request(app_config: AppConfig):
         "Accept": "application/json"
     }
 
-    response = requests.get(URL, headers=headers, params=params)
+    response = requests.get(URL_WORK_PING, headers=headers, params=params)
 
     if response.status_code == 200:
         data = response.json()
         print(f"Получено записей: {len(data)}")
         
         # Пример сохранения в JSON-файл
-        with open(app_config.work_dir / "wb_report_detail.json", "w", encoding="utf-8") as f:
+        with open(app_config.work_dir / "wb_ping.json", "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
-        print("Отчет успешно сохранен в wb_report_detail.json")
+        print("Отчет успешно сохранен в wb_ping.json")
+    else:
+        print(f"Ошибка запроса: {response.status_code}, ответ: {response.text}")
+
+def run_orders_request(app_config: AppConfig):
+    # Параметры запроса (период макс. до 30 дней за один запрос)
+    params = {
+        "dateFrom": "2026-10-01",
+        "dateTo": "2026-10-31",
+        "rrdid": 0,  # Стартовый ID для пагинации (0 с начала)
+        "limit": 100000
+    }
+    URL_ORDERS = "https://statistics-api.wildberries.ru/api/v1/supplier/orders"
+    headers = {
+        "Authorization": app_config.api_token,
+        "Accept": "application/json"
+    }
+
+    response = requests.get(URL_ORDERS, headers=headers, params=params)
+
+    if response.status_code == 200:
+        data = response.json()
+        print(f"Получено записей: {len(data)}")
+        
+        # Пример сохранения в JSON-файл
+        with open(app_config.work_dir / "wb_budget.json", "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        print("Отчет успешно сохранен в wb_budget.json")
     else:
         print(f"Ошибка запроса: {response.status_code}, ответ: {response.text}")
 
 if __name__ == "__main__":
     # print(f"API_KEY {API_KEY}")
     app_config  = AppConfig()
-    run_request(app_config)
+    run_work_ping_request(app_config)
+    run_orders_request(app_config)
