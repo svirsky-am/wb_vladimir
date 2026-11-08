@@ -1,35 +1,74 @@
-"""Общая логика: синхронизация данных и сборка реестра."""
-
+"""Общая логика sync и построения реестра — для CLI, службы и MCP."""
 import logging
-from datetime import date
+from datetime import date, timedelta
 
-from wb_sync import db
-from wb_sync.reports import build_registry_xlsx
+from . import db
+from .wb_api import WBClient
 
-logger = logging.getLogger("wb_sync.core")
-
-
-def sync_data(config, engine, client, d_from: date, d_to: date):
-    """Полный цикл выгрузки: v1 statistics + v3 FBS + карточки -> БД."""
-    logger.info("Синхронизация %s..%s (fetch_data=%s)", d_from, d_to, config.fetch_data)
-    result = {}
-    result["orders"] = db.upsert_orders(engine, client.get_orders(d_from, d_to))
-    result["sales"] = db.upsert_sales(engine, client.get_sales(d_from, d_to))
-    result["fbs_orders"] = db.upsert_fbs_orders(engine, client.get_v3_orders(d_from, d_to), client)
-    try:
-        result["cards"] = db.upsert_cards(engine, client.get_cards())
-    except Exception:
-        logger.exception("Не удалось выгрузить карточки — пропускаю, продолжаю")
-        result["cards"] = 0
-    logger.info("Синхронизация завершена: %s", result)
-    return result
+logger = logging.getLogger(__name__)
 
 
-def build_registry_report(config, engine, client, d_from: date, d_to: date, out_path):
-    orders = db.load_orders(engine, d_from, d_to)
-    fbs = {r["rid"]: r for r in db.load_fbs_orders(engine, d_from, d_to)}
-    sales = db.load_sales(engine, d_from, d_to)
-    return build_registry_xlsx(
-        orders, sales, fbs, out_path,
-        shop_name="ИП Олейник",
-    )
+def fetch_all(client: WBClient, date_from: date, date_to: date) -> dict:
+    """Параллельная выгрузка всех эндпойнтов. Упавшая задача не роняет остальные."""
+    return client.fetch_parallel({
+        "orders": lambda: client.get_orders(date_from, date_to),
+        "sales": lambda: client.get_sales(date_from, date_to),
+        "incomes": lambda: client.get_incomes(date_from, date_to),
+        "stocks": lambda: client.get_stocks(),
+        "warehouses": lambda: client.get_warehouses(),
+        "v3_orders": lambda: client.get_v3_orders(date_from, date_to),
+        "cards": lambda: client.get_cards(),
+    })
+
+
+def sync_data(config, client: WBClient | None = None) -> dict:
+    client = client or WBClient(config)
+    today = date.today()
+    date_from = today - timedelta(days=config.fetch_window_days * 3)
+    data = fetch_all(client, date_from, today)
+    engine = db.make_engine(config)
+    counts = {
+        "orders": db.upsert_orders(engine, data.get("orders") or []),
+        "sales": db.upsert_sales(engine, data.get("sales") or []),
+        "fbs_orders": db.upsert_fbs_orders(engine, data.get("v3_orders") or [], client),
+        "cards": db.upsert_cards(engine, data.get("cards") or []),
+    }
+    logger.info("Sync завершён: %s", counts)
+    return counts
+
+
+def build_registry_rows(engine, date_from: date, date_to: date) -> list[dict]:
+    """Строки реестра: статус из fbs_orders (v3), fallback по isCancel."""
+    fbs = {r["srid"]: r for r in db.load_fbs_orders(engine, date_from, date_to)}
+    rows = []
+    for o in db.load_orders(engine, date_from, date_to):
+        f = fbs.get(o["srid"])
+        status = f["status"] if f and f.get("status") else ("Отменен" if o.get("isCancel") else "Доставлен")
+        rows.append({
+            "Магазин": "ИП Олейник",
+            "Номер отправления": o["srid"],
+            "Статус": status,
+            "Принят": o["date"].isoformat() if o.get("date") else "",
+            "Артикул": o.get("article") or "",
+            "Название товара": o.get("name") or "",
+            "Стоимость": round(o.get("finishedPrice", 0) / 100, 2),
+            "Склад": "Наш склад Владимир",
+        })
+    return rows
+
+
+def build_summary(engine, date_from: date, date_to: date) -> dict:
+    sales = db.load_sales(engine, date_from, date_to)
+    active = [s for s in sales if not s.get("isCancel")]
+    total = sum(s.get("finished_price") or 0 for s in active)
+    by_day: dict = {}
+    by_article: dict = {}
+    for s in active:
+        d = s["date"].isoformat() if s.get("date") else ""
+        by_day[d] = by_day.get(d, 0.0) + (s.get("finished_price") or 0)
+        art = s.get("article") or ""
+        agg = by_article.setdefault(art, {"count": 0, "revenue": 0.0})
+        agg["count"] += 1
+        agg["revenue"] += s.get("finished_price") or 0
+    return {"period": (str(date_from), str(date_to)), "total_revenue": round(total, 2),
+            "sales_count": len(active), "by_day": by_day, "by_article": by_article}

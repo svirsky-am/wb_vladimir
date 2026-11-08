@@ -1,65 +1,56 @@
-"""asyncio-служба: периодический фетч данных по конфигу."""
-
+"""asyncio-служба: ping до старта, затем цикл sync -> пауза."""
 import asyncio
 import logging
 import signal
-import sys
-from datetime import date, timedelta
 
-from wb_sync.app_config import AppConfig
-from wb_sync import db
-from wb_sync.logging_setup import setup_logging
-from wb_sync.wb_api import WBClient
-from wb_sync.core import sync_data
+from .core import sync_data
+from .wb_api import WBClient
 
-logger = logging.getLogger("wb_sync.service")
+logger = logging.getLogger(__name__)
 
 
-def sync_cycle(config, engine, client):
-    d_to = date.today()
-    d_from = d_to - timedelta(days=config.fetch_window_days - 1)
-    return sync_data(config, engine, client, d_from, d_to)
+async def ping_wb(client: WBClient, attempts: int = 3) -> bool:
+    for i in range(1, attempts + 1):
+        try:
+            await asyncio.to_thread(client.ping)
+            logger.info("Ping WB: OK (попытка %d/%d)", i, attempts)
+            return True
+        except Exception:
+            logger.warning("Ping WB не удался (попытка %d/%d)", i, attempts, exc_info=True)
+            await asyncio.sleep(2)
+    return False
 
 
-async def run_service(config, engine, client, max_cycles=None):
-    """Цикл: sync -> sleep(fetch_interval_minutes). Ошибка цикла не роняет службу."""
-    loop = asyncio.get_running_loop()
+async def sync_cycle(client: WBClient) -> dict:
+    return await asyncio.to_thread(sync_data, client.config, client)
+
+
+async def run_service(config, cycles: int | None = None) -> None:
+    client = WBClient(config)
+    if not await ping_wb(client):
+        logger.critical("WB недоступен после ping — служба не запускается")
+        raise SystemExit(1)
+    logger.info("Служба запущена: интервал %d мин, fetch_data=%s",
+                config.fetch_interval_minutes, config.fetch_data)
     stop = asyncio.Event()
+    loop = asyncio.get_running_loop()
     for sig in (signal.SIGINT, signal.SIGTERM):
         try:
             loop.add_signal_handler(sig, stop.set)
         except NotImplementedError:
-            pass  # Windows / не-основной поток
-
-    logger.info("Служба запущена: интервал %.0f мин, fetch_data=%s",
-                config.fetch_interval_minutes, config.fetch_data)
-    cycles = 0
+            pass
+    done = 0
     while not stop.is_set():
-        cycles += 1
-        logger.info("Цикл %d: начало", cycles)
         try:
-            result = await asyncio.to_thread(sync_cycle, config, engine, client)
-            logger.info("Цикл %d: готово %s", cycles, result)
+            counts = await sync_cycle(client)
+            logger.info("Цикл %d завершён: %s", done + 1, counts)
         except Exception:
-            logger.exception("Цикл %d: ошибка синхронизации", cycles)
-        if max_cycles is not None and cycles >= max_cycles:
-            logger.info("Достигнут лимит циклов (%d), остановка", max_cycles)
+            logger.exception("Ошибка цикла — служба продолжает работу")
+        done += 1
+        if cycles is not None and done >= cycles:
             break
         try:
             await asyncio.wait_for(stop.wait(), timeout=config.fetch_interval_minutes * 60)
         except asyncio.TimeoutError:
             pass
-    logger.info("Служба остановлена")
-
-
-def main():
-    config = AppConfig()
-    setup_logging(config)
-    engine = db.make_engine(config)
-    db.init_db(engine)
-    client = WBClient(config)
-    asyncio.run(run_service(config, engine, client))
-
-
-if __name__ == "__main__":
-    main()
+    logger.info("Служба остановлена (циклов выполнено: %d)", done)

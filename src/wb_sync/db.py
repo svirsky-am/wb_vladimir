@@ -1,199 +1,194 @@
-"""SQLite через SQLAlchemy 2.0: orders, sales, fbs_orders, cards."""
-
-import logging
+"""SQLite через SQLAlchemy: orders, sales, fbs_orders, cards. Апсерт по ключу."""
 from datetime import date, datetime, timezone
 
-from sqlalchemy import (
-    String, Integer, Float, Boolean, DateTime, Date, UniqueConstraint, select,
-)
-from sqlalchemy import create_engine
-from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, sessionmaker
+from sqlalchemy import (Boolean, Column, Date, Float, Integer, String, create_engine, select)
+from sqlalchemy.orm import Session, declarative_base
 
-logger = logging.getLogger("wb_sync.db")
-
-
-class Base(DeclarativeBase):
-    pass
+Base = declarative_base()
 
 
 class Order(Base):
     __tablename__ = "orders"
-    id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    srid: Mapped[str] = mapped_column(String, unique=True)
-    date: Mapped[str] = mapped_column(String)
-    article: Mapped[str] = mapped_column(String)
-    article_name: Mapped[str] = mapped_column(String, default="")
-    warehouse: Mapped[str] = mapped_column(String, default="")
-    quantity: Mapped[int] = mapped_column(Integer, default=1)
-    price: Mapped[float] = mapped_column(Float, default=0.0)
-    status: Mapped[str] = mapped_column(String, default="")
-    is_cancel: Mapped[bool] = mapped_column(Boolean, default=False)
+    srid = Column(String, primary_key=True)
+    date = Column(Date, index=True)
+    article = Column(String, index=True)
+    name = Column(String)
+    price_rub = Column(Float)
+    is_cancel = Column(Boolean, default=False)
+    raw = Column(String)
 
 
 class Sale(Base):
     __tablename__ = "sales"
-    id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    sale_id: Mapped[str] = mapped_column(String, unique=True)
-    date: Mapped[str] = mapped_column(String)
-    srid: Mapped[str] = mapped_column(String, default="")
-    article: Mapped[str] = mapped_column(String)
-    article_name: Mapped[str] = mapped_column(String, default="")
-    finished_price: Mapped[float] = mapped_column(Float, default=0.0)
-    is_cancel: Mapped[bool] = mapped_column(Boolean, default=False)
+    sale_id = Column(String, primary_key=True)
+    srid = Column(String, index=True)
+    date = Column(Date, index=True)
+    article = Column(String, index=True)
+    finished_price_rub = Column(Float)
+    is_cancel = Column(Boolean, default=False)
+    raw = Column(String)
 
 
 class FbsOrder(Base):
     __tablename__ = "fbs_orders"
-    id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    rid: Mapped[str] = mapped_column(String, unique=True)
-    nm_id: Mapped[int] = mapped_column(Integer, default=0)
-    created_at: Mapped[str] = mapped_column(String, default="")
-    price: Mapped[float] = mapped_column(Float, default=0.0)
-    status: Mapped[str] = mapped_column(String, default="")
-    is_cancel: Mapped[bool] = mapped_column(Boolean, default=False)
+    srid = Column(String, primary_key=True)
+    created_at = Column(Date, index=True)
+    article = Column(String, index=True)
+    price_rub = Column(Float)
+    supplier_status = Column(String)
+    status = Column(String)
+    is_cancel = Column(Boolean, default=False)
+    raw = Column(String)
 
 
 class Card(Base):
     __tablename__ = "cards"
-    id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    nm_id: Mapped[int] = mapped_column(Integer, unique=True)
-    article: Mapped[str] = mapped_column(String, default="")
-    title: Mapped[str] = mapped_column(String, default="")
-    brand: Mapped[str] = mapped_column(String, default="")
-    category: Mapped[str] = mapped_column(String, default="")
-    updated_at: Mapped[str] = mapped_column(String, default="")
-    raw: Mapped[str] = mapped_column(String, default="{}")
+    nm_id = Column(Integer, primary_key=True)
+    article = Column(String, index=True)
+    title = Column(String)
+    category = Column(String)
+    brand = Column(String)
+    raw = Column(String)
 
 
-def make_engine(config):
-    return create_engine(f"sqlite:///{config.database_path}")
-
-
-def init_db(engine):
+def make_engine(config) -> object:
+    engine = create_engine(f"sqlite:///{config.database_path}")
     Base.metadata.create_all(engine)
+    return engine
 
 
-# ----- апсерты: идемпотентны, дубли исключены -----
-def _upsert(session, model, unique_attr, unique_value, values: dict):
-    obj = session.execute(
-        select(model).where(getattr(model, unique_attr) == unique_value)
-    ).scalar_one_or_none()
-    if obj is None:
-        session.add(model(**values))
-        return 1
-    for k, v in values.items():
-        setattr(obj, k, v)
-    return 0
+def _parse_date(value) -> date | None:
+    if value in (None, ""):
+        return None
+    if isinstance(value, date):
+        return value
+    if isinstance(value, (int, float)):
+        return datetime.fromtimestamp(value, tz=timezone.utc).date()
+    return date.fromisoformat(str(value)[:10])
 
 
-def upsert_orders(engine, rows):
+def upsert_orders(engine, rows: list) -> int:
     added = 0
-    with sessionmaker(engine)() as s:
+    with Session(engine) as s:
         for r in rows:
-            added += _upsert(s, Order, "srid", r["srid"], {
-                "srid": r["srid"],
-                "date": r.get("date", ""),
-                "article": r.get("article", "") or r.get("supplierArticle", ""),
-                "article_name": r.get("article_name", ""),
-                "warehouse": r.get("warehouseName", ""),
-                "quantity": int(r.get("quantity", 1) or 1),
-                "price": r.get("price", 0.0),
-                "status": r.get("status", ""),
-                "is_cancel": bool(r.get("isCancel", False)),
-            })
+            srid = str(r.get("srid") or r.get("rid") or "")
+            if not srid:
+                continue
+            obj = s.get(Order, srid)
+            if obj is None:
+                obj = Order(srid=srid)
+                s.add(obj)
+                added += 1
+            obj.date = _parse_date(r.get("date"))
+            obj.article = r.get("supplierArticle")
+            obj.name = r.get("goodsName") or obj.name
+            obj.price_rub = (r.get("finishedPrice") or 0) / 100  # копейки -> рубли
+            obj.is_cancel = bool(r.get("isCancel", False))
+            s.flush()
         s.commit()
-    logger.info("orders: %d новых записей из %d", added, len(rows))
     return added
 
 
-def upsert_sales(engine, rows):
+def upsert_sales(engine, rows: list) -> int:
     added = 0
-    with sessionmaker(engine)() as s:
+    with Session(engine) as s:
         for r in rows:
-            added += _upsert(s, Sale, "sale_id", r["saleID"], {
-                "sale_id": r["saleID"],
-                "date": r.get("date", ""),
-                "srid": r.get("srid", ""),
-                "article": r.get("article", "") or r.get("supplierArticle", ""),
-                "article_name": r.get("article_name", ""),
-                "finished_price": r.get("finishedPrice", 0) / 100.0,  # копейки -> рубли
-                "is_cancel": bool(r.get("isCancel", False)),
-            })
+            sid = str(r.get("saleID") or "")
+            if not sid:
+                continue
+            obj = s.get(Sale, sid)
+            if obj is None:
+                obj = Sale(sale_id=sid)
+                s.add(obj)
+                added += 1
+            obj.srid = str(r.get("srid") or "")
+            obj.date = _parse_date(r.get("date"))
+            obj.article = r.get("supplierArticle")
+            obj.finished_price_rub = (r.get("finishedPrice") or 0) / 100  # копейки -> рубли
+            obj.is_cancel = bool(r.get("isCancel", False))
+            s.flush()
         s.commit()
-    logger.info("sales: %d новых записей из %d", added, len(rows))
     return added
 
 
-def upsert_fbs_orders(engine, rows, client):
+def upsert_fbs_orders(engine, rows: list, client) -> int:
     added = 0
-    with sessionmaker(engine)() as s:
+    with Session(engine) as s:
         for r in rows:
-            ts = r.get("createdAt")
-            created = (
-                datetime.fromtimestamp(ts / 1000, tz=timezone.utc).isoformat()
-                if isinstance(ts, (int, float)) else str(ts or "")
-            )
-            added += _upsert(s, FbsOrder, "rid", r["rid"], {
-                "rid": r["rid"],
-                "nm_id": int(r.get("nmId", 0) or 0),
-                "created_at": created,
-                "price": r.get("price", 0.0),  # v3 отдаёт рубли
-                "status": client.normalize_v3_status(r) if hasattr(client, "normalize_v3_status") else normalize_v3_status(r),
-                "is_cancel": bool((r.get("statuses") or {}).get("isCancel", False)),
-            })
+            srid = str(r.get("rid") or "")
+            if not srid:
+                continue
+            st = r.get("statuses") or {}
+            status = status_to_ru_obj(st.get("supplierStatus"), bool(st.get("isCancel", False)))
+            obj = s.get(FbsOrder, srid)
+            if obj is None:
+                obj = FbsOrder(srid=srid)
+                s.add(obj)
+                added += 1
+            obj.created_at = _parse_date(r.get("createdAt"))
+            obj.article = r.get("article")
+            obj.price_rub = r.get("price")  # v3 уже в рублях
+            obj.supplier_status = st.get("supplierStatus")
+            obj.status = status
+            obj.is_cancel = bool(st.get("isCancel", False))
+            s.flush()
         s.commit()
-    logger.info("fbs_orders: %d новых записей из %d", added, len(rows))
     return added
 
 
-def upsert_cards(engine, cards):
-    import json as _json
+def upsert_cards(engine, rows: list) -> int:
     added = 0
-    with sessionmaker(engine)() as s:
-        for c in cards:
-            added += _upsert(s, Card, "nm_id", c.get("nmID"), {
-                "nm_id": c.get("nmID"),
-                "article": c.get("vendorCode", ""),
-                "title": c.get("title", ""),
-                "brand": c.get("brand", ""),
-                "category": c.get("category", ""),
-                "updated_at": c.get("updatedAt", ""),
-                "raw": _json.dumps(c, ensure_ascii=False),
-            })
+    with Session(engine) as s:
+        for r in rows:
+            nm = r.get("nmID")
+            if not nm:
+                continue
+            obj = s.get(Card, nm)
+            if obj is None:
+                obj = Card(nm_id=nm)
+                s.add(obj)
+                added += 1
+            obj.article = r.get("vendorCode")
+            obj.title = (r.get("title") or "").strip()
+            obj.category = r.get("category") or ((r.get("parentName") or [None])[0])
+            obj.brand = r.get("brand")
+            s.flush()
         s.commit()
-    logger.info("cards: %d новых карточек из %d", added, len(cards))
     return added
 
 
-def load_orders(engine, d_from: date, d_to: date):
-    with sessionmaker(engine)() as s:
-        rows = s.execute(select(Order).where(Order.date >= d_from.isoformat(),
-                                             Order.date <= d_to.isoformat())).scalars().all()
-        return [dict(srid=r.srid, date=r.date, article=r.article,
-                     article_name=r.article_name, warehouseName=r.warehouse,
-                     quantity=r.quantity, price=r.price, status=r.status,
-                     isCancel=r.is_cancel) for r in rows]
+def status_to_ru_obj(status: str, is_cancel: bool) -> str:
+    ru = {"new": "Ожидает сборки", "confirm": "Готов к отгрузке",
+          "complete": "Доставляется", "sent_to_carrier": "Доставляется",
+          "delivered": "Доставлен", "cancel": "Отменен", "cancellation": "Отменен",
+          }.get((status or "").lower(), status or "неизвестно")
+    if is_cancel:
+        ru = "Отменен"
+    return ru
 
 
-def load_sales(engine, d_from: date, d_to: date):
-    with sessionmaker(engine)() as s:
-        rows = s.execute(select(Sale).where(Sale.date >= d_from.isoformat(),
-                                            Sale.date <= d_to.isoformat())).scalars().all()
-        return [dict(saleID=r.sale_id, date=r.date, srid=r.srid, article=r.article,
-                     article_name=r.article_name, finished_price=r.finished_price,
-                     isCancel=r.is_cancel) for r in rows]
+def load_orders(engine, date_from: date, date_to: date) -> list[dict]:
+    out = []
+    with Session(engine) as s:
+        for o in s.scalars(select(Order).where(Order.date.between(date_from, date_to))):
+            out.append({"srid": o.srid, "date": o.date, "article": o.article, "name": o.name,
+                        "finishedPrice": int((o.price_rub or 0) * 100), "isCancel": o.is_cancel})
+    return out
 
 
-def load_fbs_orders(engine, d_from: date, d_to: date):
-    with sessionmaker(engine)() as s:
-        rows = s.execute(select(FbsOrder).where(FbsOrder.created_at >= d_from.isoformat(),
-                                                FbsOrder.created_at <= d_to.isoformat())).scalars().all()
-        return [dict(rid=r.rid, nmId=r.nm_id, createdAt=r.created_at,
-                     price=r.price, status=r.status, isCancel=r.is_cancel) for r in rows]
+def load_sales(engine, date_from: date, date_to: date) -> list[dict]:
+    out = []
+    with Session(engine) as s:
+        for x in s.scalars(select(Sale).where(Sale.date.between(date_from, date_to))):
+            out.append({"saleID": x.sale_id, "srid": x.srid, "date": x.date, "article": x.article,
+                        "finished_price": x.finished_price_rub, "isCancel": x.is_cancel})
+    return out
 
 
-def load_cards(engine):
-    with sessionmaker(engine)() as s:
-        rows = s.execute(select(Card)).scalars().all()
-        return [dict(nmID=r.nm_id, article=r.article, title=r.title,
-                     brand=r.brand, category=r.category, updatedAt=r.updated_at) for r in rows]
+def load_fbs_orders(engine, date_from: date, date_to: date) -> list[dict]:
+    out = []
+    with Session(engine) as s:
+        for o in s.scalars(select(FbsOrder).where(FbsOrder.created_at.between(date_from, date_to))):
+            out.append({"srid": o.srid, "status": o.status, "article": o.article,
+                        "price_rub": o.price_rub, "isCancel": o.is_cancel})
+    return out

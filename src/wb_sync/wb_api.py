@@ -1,19 +1,17 @@
-"""Клиент WB API: v1 statistics, /api/v3/orders (FBS), контент (карточки).
-
-Все обращения к API логируются: INFO — каждая попытка (успешная и неуспешная),
-ERROR — окончательная неудача после ретраев. Сырые ответы сохраняются в
-work_dir/responses/<имя>_<временная_метка>.json.
-"""
-
+"""Клиент API Wildberries: логирование, троттлинг, ретраи, кеш, песочница."""
 import json
 import logging
+import threading
 import time
-from datetime import date, datetime, timedelta
+from concurrent.futures import ThreadPoolExecutor
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 import requests
 
-logger = logging.getLogger("wb_sync.wb_api")
+from .app_config import AppConfig
+
+logger = logging.getLogger(__name__)
 
 STATUS_RU = {
     "new": "Ожидает сборки",
@@ -25,279 +23,243 @@ STATUS_RU = {
     "cancellation": "Отменен",
 }
 
-H = "https://{host}"
-
 
 class CachedDataMissingError(RuntimeError):
-    """Кеш в work_dir не найден, а fetch_data=False."""
+    """Данных нет ни в сети (fetch_data=False), ни в кеше."""
 
 
-def _host(base: str, sandbox: bool) -> str:
-    return base if not sandbox else base.replace(".wildberries.ru", "-api-sandbox.wildberries.ru")
+def normalize_v3_status(status: str) -> str:
+    return STATUS_RU.get((status or "").lower(), status or "неизвестно")
 
 
-def normalize_v3_status(row: dict) -> str:
-    statuses = row.get("statuses") or {}
-    supplier = (statuses.get("supplierStatus") or "").strip().lower()
-    if supplier in STATUS_RU:
-        return STATUS_RU[supplier]
-    wb = (statuses.get("wbStatus") or "").strip().lower()
-    if wb in STATUS_RU:
-        return STATUS_RU[wb]
-    return "Готов к отгрузке"
+def status_to_ru(client: "WBClient", status: str, is_cancel: bool) -> str:
+    ru = normalize_v3_status(status)
+    if is_cancel and ru != "Отменен":
+        ru = "Отменен"
+    return ru
 
 
-def chunk_periods(date_from: date, date_to: date, window_days: int):
-    """Разбивает период на чанки не длиннее window_days (включительно)."""
-    if date_from > date_to:
-        raise ValueError("date_from позже date_to")
+def chunk_periods(date_from: date, date_to: date, window_days: int = 30):
+    """Период -> чанки по window_days включительно (лимит WB — 30 дней на запрос)."""
+    if date_to < date_from:
+        raise ValueError("date_to раньше date_from")
     chunks = []
-    start = date_from
-    while start <= date_to:
-        end = min(start + timedelta(days=window_days - 1), date_to)
-        chunks.append((start, end))
-        start = end + timedelta(days=1)
+    cur = date_from
+    while cur <= date_to:
+        end = min(cur + timedelta(days=window_days - 1), date_to)
+        chunks.append((cur, end))
+        cur = end + timedelta(days=1)
     return chunks
 
 
-def _cache_name(prefix: str, d_from: date, d_to: date) -> str:
-    return f"{prefix}_{d_from.isoformat()}_{d_to.isoformat()}.json"
+def _ms(dt: date) -> int:
+    return int(datetime(dt.year, dt.month, dt.day, tzinfo=timezone.utc).timestamp() * 1000)
 
 
 class WBClient:
-    statistics_base = "statistics-api.wildberries.ru"
-    marketplace_base = "marketplace-api.wildberries.ru"
-    content_base = "content-api.wildberries.ru"
-    common_base = "common-api.wildberries.ru"
+    V1_HOST = "https://statistics-api.wildberries.ru"
+    V3_HOST = "https://marketplace-api.wildberries.ru"
+    CONTENT_HOST = "https://content-api.wildberries.ru"
+    COMMON_HOST = "https://common-api.wildberries.ru"
 
-    def __init__(self, config):
+    def __init__(self, config: AppConfig):
         self.config = config
-        self._session = requests.Session()
-        self._session.headers.update(
-            {"Authorization": config.api_token, "Accept": "application/json"}
-        )
+        self._session = threading.local()
         self._last_request_at = 0.0
+        self._throttle_lock = threading.Lock()
 
-    # ----- низкий уровень: логирование, троттлинг, ретраи -----
-    def _throttle(self):
-        interval = getattr(self.config, "min_request_interval", 1.0)
-        wait = self._last_request_at + interval - time.monotonic()
-        if wait > 0:
-            logger.info("Троттлинг: пауза %.1f с перед следующим запросом", wait)
-            time.sleep(wait)
-        self._last_request_at = time.monotonic()
+    # --- песочница -------------------------------------------------------
+    def _host(self, base: str) -> str:
+        if not self.config.sandbox:
+            return base
+        return base.replace("wildberries.ru", "-sandbox.wildberries.ru")
 
-    def _save_response(self, method: str, url: str, payload):
-        responses_dir = self.config.work_dir / "responses"
-        responses_dir.mkdir(parents=True, exist_ok=True)
-        stamp = datetime.now().strftime("%Y%m%dT%H%M%S")
-        safe = url.replace("https://", "").replace("/", "_").replace("?", "_").replace("=", "_").replace("&", "_").replace(".", "_")
-        name = f"{method}_{safe}_{stamp}.json"
-        with open(responses_dir / name, "w", encoding="utf-8") as f:
-            json.dump(payload, f, ensure_ascii=False, indent=2)
-        return responses_dir / name
+    # --- сессия и троттлинг ----------------------------------------------
+    @property
+    def session(self) -> requests.Session:
+        s = getattr(self._session, "s", None)
+        if s is None:
+            s = requests.Session()
+            s.headers.update({"Authorization": self.config.api_token, "Accept": "application/json"})
+            self._session.s = s
+        return s
 
-    def request(self, method: str, url: str, *, params=None, json_body=None):
-        """Запрос с логированием попыток и ретраями на 429/5xx.
-
-        Логи:
-          INFO  — каждая попытка (успех и неуспех);
-          ERROR — окончательная неудача.
-        Пауза между ретраями: Retry-After, иначе экспоненциальный backoff.
-        """
-        max_retries = getattr(self.config, "max_retries", 5)
-        base_delay = getattr(self.config, "retry_base_delay", 5.0)
-        attempt = 0
+    def _throttle(self) -> None:
+        interval = max(self.config.min_request_interval, 0.0)
         while True:
-            attempt += 1
+            with self._throttle_lock:
+                now = time.monotonic()
+                wait = self._last_request_at + interval - now
+                if wait <= 0:
+                    self._last_request_at = now
+                    return
+            time.sleep(min(wait, 0.5))
+
+    def _save_response(self, label: str, payload) -> None:
+        """Сырой ответ -> work_dir/responses/<label>_<timestamp>.json"""
+        try:
+            d = self.config.work_dir / "responses"
+            d.mkdir(parents=True, exist_ok=True)
+            ts = datetime.now().strftime("%Y%m%dT%H%M%S")
+            path = d / f"{label}_{ts}.json"
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(payload, f, ensure_ascii=False, indent=2, default=str)
+        except Exception:  # сохранение ответа не должно ломать выгрузку
+            logger.warning("Не удалось сохранить сырой ответ %s", label, exc_info=True)
+
+    # --- ядро запроса -----------------------------------------------------
+    def request(self, method: str, url: str, label: str = "", *, params=None, json_body=None) -> object:
+        label = label or f"{method} {url}"
+        total = self.config.max_retries + 1
+        last_err = None
+        for attempt in range(1, total + 1):
             self._throttle()
             started = time.monotonic()
             try:
-                resp = self._session.request(
-                    method, url, params=params, json=json_body, timeout=60
-                )
-            except requests.RequestException as exc:
-                logger.info(
-                    "Попытка %d/%d %s %s — сетевая ошибка: %s",
-                    attempt, max_retries + 1, method, url, exc,
-                )
-                if attempt > max_retries:
-                    logger.error("Сетевые ошибки исчерпаны: %s %s", method, url)
-                    raise
-                delay = base_delay * (2 ** (attempt - 1))
-                logger.info("Пауза %.0f с перед повторной попыткой", delay)
-                time.sleep(delay)
-                continue
-
-            elapsed = time.monotonic() - started
-            size = len(resp.content) if resp.content else 0
-
-            if resp.status_code < 400:
-                logger.info(
-                    "%s %s → %s (%.1f КБ, %.2f с) — попытка %d",
-                    method, url, resp.status_code, size / 1024, elapsed, attempt,
-                )
-                return resp
-
-            retryable = resp.status_code == 429 or resp.status_code >= 500
-            logger.info(
-                "Попытка %d/%d %s %s — HTTP %s (%.2f с): %s",
-                attempt, max_retries + 1, method, url,
-                resp.status_code, elapsed, resp.text[:300],
-            )
-            if not retryable or attempt > max_retries:
-                logger.error(
-                    "Запрос не удался окончательно: %s %s — HTTP %s",
-                    method, url, resp.status_code,
-                )
+                logger.info("Попытка %d/%d %s", attempt, total, label)
+                resp = self.session.request(method, url, params=params, json=json_body, timeout=60)
+                elapsed = time.monotonic() - started
+                if resp.status_code == 200:
+                    logger.info("%s -> 200 (%.1f КБ, %.2f с)", label, len(resp.content) / 1024, elapsed)
+                    return resp.json()
+                if resp.status_code == 429 or resp.status_code >= 500:
+                    logger.info("Попытка %d/%d %s — HTTP %d (%.2f с)", attempt, total, label, resp.status_code, elapsed)
+                    retry_after = resp.headers.get("Retry-After")
+                    delay = float(retry_after) if (retry_after or "").isdigit() else self.config.retry_base_delay * (2 ** (attempt - 1))
+                    logger.info("HTTP %d: пауза %.0f с перед попыткой %d/%d", resp.status_code, delay, attempt + 1, total)
+                    last_err = f"HTTP {resp.status_code}"
+                    time.sleep(delay)
+                    continue
                 resp.raise_for_status()
-                return resp
+            except requests.HTTPError:
+                logger.error("Запрос не удался окончательно: %s — HTTP %d", label, resp.status_code)
+                raise
+            except requests.RequestException as exc:
+                logger.info("Попытка %d/%d %s — сетевая ошибка: %s", attempt, total, label, exc)
+                last_err = str(exc)
+                delay = self.config.retry_base_delay * (2 ** (attempt - 1))
+                time.sleep(delay)
+        raise RuntimeError(f"Запрос не удался после {total} попыток: {label} — {last_err}")
 
-            retry_after = resp.headers.get("Retry-After")
-            if retry_after and retry_after.isdigit():
-                delay = float(retry_after)
-            else:
-                delay = base_delay * (2 ** (attempt - 1))
-            logger.info(
-                "HTTP %s: пауза %.0f с перед попыткой %d/%d",
-                resp.status_code, delay, attempt + 1, max_retries + 1,
-            )
-            time.sleep(delay)
+    # --- ping -------------------------------------------------------------
+    def ping(self) -> dict:
+        return self.request("GET", f"{self._host(self.COMMON_HOST)}/ping", label="GET /ping")
 
-    # ----- кеш -----
-    def _cache_path(self, prefix: str, d_from: date, d_to: date) -> Path:
-        return self.config.work_dir / _cache_name(prefix, d_from, d_to)
-
-    def _fetch_or_cache(self, prefix, d_from, d_to, fetcher):
-        """fetch_data=True — обращаемся к API и обновляем снапшот,
-        иначе читаем кеш; нет кеша — CachedDataMissingError."""
-        cache = self._cache_path(prefix, d_from, d_to)
-        if self.config.fetch_data:
-            payload = fetcher()
-            with open(cache, "w", encoding="utf-8") as f:
-                json.dump(payload, f, ensure_ascii=False, indent=2)
-            return payload
-        if not cache.exists():
+    # --- statistics-api v1 --------------------------------------------------
+    def _fetch_v1(self, path: str, label: str, date_from: date, date_to: date) -> list:
+        """v1: если fetch_data — сеть (обновляя кеш), иначе — только кеш всего периода."""
+        key = f"v1_{path.rsplit('/', 1)[-1]}_{date_from}_{date_to}"
+        cache = self.config.work_dir / f"{key}.json"
+        if not self.config.fetch_data:
+            if cache.exists():
+                logger.info("Кеш: %s", cache.name)
+                return json.loads(cache.read_text(encoding="utf-8"))
             raise CachedDataMissingError(
-                f"Кеш {cache.name} не найден, а fetch_data=False. "
-                f"Запустите sync с FETCH_DATA=1."
-            )
-        logger.info("Кеш: %s", cache.name)
-        with open(cache, "r", encoding="utf-8") as f:
-            return json.load(f)
-
-    # ----- v1 statistics -----
-    def _v1(self, endpoint: str, d_from: date, d_to: date):
-        url = H.format(host=_host(self.statistics_base, self.config.sandbox)) + endpoint
+                f"Кеш {cache.name} не найден, а fetch_data=False — запустите sync с выгрузкой")
         rows = []
-        for c_from, c_to in chunk_periods(d_from, d_to, self.config.fetch_window_days):
-            params = {
-                "dateFrom": c_from.isoformat(),
-                "dateTo": c_to.isoformat(),
-                "rrdid": 0,
-                "limit": 100000,
-            }
-            resp = self.request("GET", url, params=params)
-            rows.extend(resp.json())
+        for a, b in chunk_periods(date_from, date_to, self.config.fetch_window_days):
+            data = self.request("GET", f"{self._host(self.V1_HOST)}{path}", label=f"GET {path} {a}..{b}",
+                                params={"dateFrom": a.isoformat(), "dateTo": b.isoformat(), "limit": 100000})
+            rows.extend(data if isinstance(data, list) else [])
+        cache.write_text(json.dumps(rows, ensure_ascii=False), encoding="utf-8")
         return rows
 
-    def get_orders(self, d_from: date, d_to: date):
-        return self._fetch_or_cache(
-            "wb_orders", d_from, d_to,
-            lambda: self._v1("/api/v1/supplier/orders", d_from, d_to),
-        )
+    def get_orders(self, date_from: date, date_to: date) -> list:
+        return self._fetch_v1("/api/v1/supplier/orders", "orders", date_from, date_to)
 
-    def get_sales(self, d_from: date, d_to: date):
-        return self._fetch_or_cache(
-            "wb_sales", d_from, d_to,
-            lambda: self._v1("/api/v1/supplier/sales", d_from, d_to),
-        )
+    def get_sales(self, date_from: date, date_to: date) -> list:
+        return self._fetch_v1("/api/v1/supplier/sales", "sales", date_from, date_to)
 
-    def get_incomes(self, d_from: date, d_to: date):
-        return self._fetch_or_cache(
-            "wb_incomes", d_from, d_to,
-            lambda: self._v1("/api/v1/supplier/incomes", d_from, d_to),
-        )
+    def get_incomes(self, date_from: date, date_to: date) -> list:
+        return self._fetch_v1("/api/v1/supplier/incomes", "incomes", date_from, date_to)
 
-    def get_stocks(self):
-        def _fetch():
-            url = H.format(host=_host(self.statistics_base, self.config.sandbox))
-            return self.request("GET", url + "/api/v1/supplier/stocks").json()
-        if self.config.fetch_data:
-            payload = _fetch()
-            path = self.config.work_dir / "wb_stocks.json"
-            with open(path, "w", encoding="utf-8") as f:
-                json.dump(payload, f, ensure_ascii=False, indent=2)
-            return payload
-        path = self.config.work_dir / "wb_stocks.json"
-        if not path.exists():
-            raise CachedDataMissingError("Кеш wb_stocks.json не найден, а fetch_data=False")
-        with open(path, "r", encoding="utf-8") as f:
-            return json.load(f)
+    def get_stocks(self) -> list:
+        if not self.config.fetch_data:
+            return self._read_cache("v1_stocks", [])
+        data = self.request("GET", f"{self._host(self.V1_HOST)}/api/v1/supplier/stocks", label="GET /api/v1/supplier/stocks")
+        self._write_cache("v1_stocks", data)
+        return data
 
-    # ----- v3 FBS orders: GET с query-параметрами, пагинация через next -----
-    def get_v3_orders(self, d_from: date, d_to: date):
-        url = H.format(host=_host(self.marketplace_base, self.config.sandbox))
-        url += "/api/v3/orders"
+    def get_warehouses(self) -> list:
+        if not self.config.fetch_data:
+            return self._read_cache("v1_warehouses", [])
+        data = self.request("GET", f"{self._host(self.V1_HOST)}/api/v1/supplier/warehouses", label="GET /api/v1/supplier/warehouses")
+        self._write_cache("v1_warehouses", data)
+        return data
 
-        def _fetch():
-            rows = []
+    def _cache_path(self, key: str) -> Path:
+        return self.config.work_dir / f"{key}.json"
+
+    def _write_cache(self, key: str, data) -> None:
+        self._cache_path(key).write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+
+    def _read_cache(self, key: str, default):
+        p = self._cache_path(key)
+        if p.exists():
+            return json.loads(p.read_text(encoding="utf-8"))
+        return default
+
+    # --- marketplace-api v3 -------------------------------------------------
+    def get_v3_orders(self, date_from: date, date_to: date) -> list:
+        """GET /api/v3/orders: limit<=1000, next, dateFrom/dateTo в Unix-секундах, окно <= 30 дней."""
+        rows = []
+        for a, b in chunk_periods(date_from, date_to, self.config.fetch_window_days):
             next_cursor = 0
-            for c_from, c_to in chunk_periods(d_from, d_to, self.config.fetch_window_days):
-                next_cursor = 0
-                while True:
-                    params = {
-                        "limit": 1000,
-                        "next": next_cursor,
-                        "dateFrom": int(datetime.combine(c_from, datetime.min.time()).timestamp()),
-                        "dateTo": int(datetime.combine(c_to, datetime.max.time()).timestamp()),
-                    }
-                    resp = self.request("GET", url, params=params)
-                    data = resp.json()
-                    rows.extend(data.get("orders", []))
-                    next_cursor = data.get("next", 0)
-                    if not next_cursor:
-                        break
-            return rows
-
-        return self._fetch_or_cache("wb_v3_orders", d_from, d_to, _fetch)
-
-    # ----- карточки -----
-    def get_cards(self):
-        url = H.format(host=_host(self.content_base, self.config.sandbox))
-        url += "/content/v2/get/cards/list"
-
-        def _fetch():
-            cards, cursor = [], {"limit": 100}
             while True:
-                resp = self.request("POST", url, json_body={"settings": cursor})
-                data = resp.json()
-                batch = data.get("data", {}).get("cards", [])
-                cards.extend(batch)
-                total = data.get("data", {}).get("total", 0)
-                if not batch or total < cursor["limit"] or len(cards) >= total:
+                data = self.request(
+                    "GET", f"{self._host(self.V3_HOST)}/api/v3/orders",
+                    label=f"GET /api/v3/orders {a}..{b} next={next_cursor}",
+                    params={"dateFrom": int(datetime(a.year, a.month, a.day, tzinfo=timezone.utc).timestamp()),
+                            "dateTo": int(datetime(b.year, b.month, b.day, 23, 59, 59, tzinfo=timezone.utc).timestamp()),
+                            "limit": 1000, "next": next_cursor})
+                rows.extend(data.get("orders", []))
+                next_cursor = data.get("next", 0)
+                if not next_cursor:
                     break
-                cursor = {
-                    "limit": 100,
-                    "updatedAt": batch[-1].get("updatedAt"),
-                    "nmID": batch[-1].get("nmID"),
-                }
-            return cards
+        self._write_cache(f"v3_orders_{date_from}_{date_to}", rows)
+        return rows
 
-        return self._fetch_or_cache("wb_cards", date(2000, 1, 1), date.today(), _fetch)
+    # --- content-api: карточки ----------------------------------------------
+    def get_cards(self) -> list:
+        """POST /content/v2/get/cards/list — курсорная пагинация (limit<=100)."""
+        host = self._host(self.CONTENT_HOST)
+        cards, cursor = [], {"limit": 100}
+        while True:
+            data = self.request("POST", f"{host}/content/v2/get/cards/list", label="POST /content/v2/get/cards/list",
+                                json_body={"settings": {"cursor": cursor, "filter": {"withPhotoOnly": False}}})
+            body = data.get("data", {})
+            cards.extend(body.get("cards", []))
+            total = body.get("total", 0)
+            new_cursor = body.get("cursor")
+            if total < cursor["limit"] or not new_cursor:
+                break
+            cursor = new_cursor
+        self._write_cache("cards", cards)
+        return cards
 
-    def update_cards(self, cards_payload: list):
-        url = H.format(host=_host(self.content_base, self.config.sandbox))
-        url += "/content/v2/cards/update"
-        resp = self.request("POST", url, json_body={"data": cards_payload})
-        return resp.json()
+    def update_cards(self, payload: dict) -> object:
+        return self.request("POST", f"{self._host(self.CONTENT_HOST)}/content/v2/cards/update",
+                            label="POST /content/v2/cards/update", json_body=payload)
 
-    def create_cards(self, cards_payload: list):
-        url = H.format(host=_host(self.content_base, self.config.sandbox))
-        url += "/content/v2/cards/upload"
-        resp = self.request("POST", url, json_body={"data": cards_payload})
-        return resp.json()
+    def create_cards(self, payload: dict) -> object:
+        return self.request("POST", f"{self._host(self.CONTENT_HOST)}/content/v2/cards/upload",
+                            label="POST /content/v2/cards/upload", json_body=payload)
 
-    def ping(self):
-        url = H.format(host=_host(self.common_base, self.config.sandbox)) + "/ping"
-        return self.request("GET", url).json()
+    # --- параллельная выгрузка ----------------------------------------------
+    def fetch_parallel(self, tasks: dict) -> dict:
+        """tasks: {имя: callable}. Возвращает {имя: результат или None}. Ошибка задачи не роняет остальные."""
+        results = {}
+
+        def run(name, fn):
+            try:
+                return name, fn()
+            except Exception:
+                logger.exception("Задача %s упала", name)
+                return name, None
+
+        with ThreadPoolExecutor(max_workers=max(self.config.fetch_workers, 1)) as pool:
+            futures = [pool.submit(run, name, fn) for name, fn in tasks.items()]
+            for fut in futures:
+                name, value = fut.result()
+                results[name] = value
+        return results

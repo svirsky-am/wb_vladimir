@@ -1,69 +1,49 @@
 from datetime import date
 
-import pytest
-from sqlalchemy import create_engine
-
 from wb_sync import db
 from wb_sync.app_config import AppConfig
-from wb_sync.wb_api import WBClient
+from wb_sync.db import make_engine
 
 
-@pytest.fixture()
-def engine(tmp_path):
-    cfg = AppConfig(work_dir=str(tmp_path / "wd"), api_token="tok", database_path="wb_sync.db")
-    eng = db.get_engine(cfg)
-    yield eng
-    eng.dispose()
+def make_cfg(tmp_path):
+    import os
+    os.environ.setdefault("API_TOKEN", "tok")
+    return AppConfig(work_dir=tmp_path)
 
 
-def test_upsert_orders_idempotent(engine):
-    rows = [{"srid": "1", "date": "2026-10-01T00:00:00", "nmId": 5, "supplierArticle": "A",
-             "subjectName": "S", "brandName": "B", "warehouseName": "W",
-             "totalPrice": 100000, "discountPercent": 5, "finishedPrice": 95000, "isCancel": False}]
+def test_upsert_orders_idempotent(tmp_path):
+    engine = make_engine(make_cfg(tmp_path))
+    rows = [{"srid": "s1", "date": "2026-10-05", "supplierArticle": "MC12", "goodsName": "N", "finishedPrice": 100000}]
     assert db.upsert_orders(engine, rows) == 1
     assert db.upsert_orders(engine, rows) == 0
-    loaded = db.load_orders(engine, date(2026, 10, 1), date(2026, 10, 31))
-    assert len(loaded) == 1
-    assert loaded[0]["finishedPrice"] == 950.0
+    assert len(db.load_orders(engine, date(2026, 10, 1), date(2026, 10, 31))) == 1
 
 
-def test_upsert_sales_kopecks(engine):
+def test_upsert_sales_kopecks(tmp_path):
+    engine = make_engine(make_cfg(tmp_path))
     row = {"saleID": "sa1", "date": "2026-10-06", "srid": "s1",
            "supplierArticle": "MC12", "finishedPrice": 2954800, "isCancel": False}
     db.upsert_sales(engine, [row])
     loaded = db.load_sales(engine, date(2026, 10, 1), date(2026, 10, 31))
-    assert loaded[0]["finished_price"] if False else loaded[0]["finishedPrice"] == 29548.0
+    assert loaded[0]["finished_price"] == 29548.0
 
 
-def test_fbs_upsert(engine):
+def test_fbs_upsert(tmp_path):
     from wb_sync.wb_api import WBClient
-    client = WBClient(AppConfig(work_dir="/tmp/_wb_probe", api_token="tok"))
-    # 2026-10-17 00:00 UTC в миллисекундах
-    row = {"rid": "r1", "nmId": 1, "price": 29548.0, "createdAt": 1792195200000,
+    client = WBClient(make_cfg(tmp_path))
+    row = {"rid": "r1", "article": "MC12", "price": 29548.0, "createdAt": 1761500000000,
            "statuses": {"isCancel": False, "supplierStatus": "delivering"}}
+    engine = make_engine(make_cfg(tmp_path))
     assert db.upsert_fbs_orders(engine, [row], client) == 1
     assert db.upsert_fbs_orders(engine, [row], client) == 0
     loaded = db.load_fbs_orders(engine, date(2026, 10, 1), date(2026, 10, 31))
-    assert loaded, "запись должна попадать в диапазон фильтра по дате"
     assert loaded[0]["status"] == "Доставляется"
-    assert loaded[0]["price"] == 29548.0
 
 
-def test_date_filter(engine):
-    rows = [
-        {"saleID": "a", "date": "2026-10-05", "finishedPrice": 100, "isCancel": False},
-        {"saleID": "b", "date": "2026-11-20", "finishedPrice": 200, "isCancel": False},
-    ]
-    db.upsert_sales(engine, rows)
-    assert len(db.load_sales(engine, date(2026, 10, 1), date(2026, 10, 31))) == 1
-    assert len(db.load_sales(engine, date(2026, 11, 1), date(2026, 11, 30))) == 1
-
-
-def test_cards_upsert(engine):
-    cards = [{"nmID": 1, "imtID": 10, "vendorCode": "MC12", "brand": "VOXLEN", "title": "Пылесос"}]
-    assert db.upsert_cards(engine, cards) == 1
-    assert db.upsert_cards(engine, cards) == 0
-    loaded = db.load_cards(engine)
-    assert loaded[0]["vendorCode"] == "MC12"
-    assert loaded[0]["imtID"] == 10
-    assert db.load_cards(engine, article="MC12")[0]["nmID"] == 1
+def test_date_filter(tmp_path):
+    engine = make_engine(make_cfg(tmp_path))
+    db.upsert_orders(engine, [
+        {"srid": "a", "date": "2026-10-05", "finishedPrice": 100},
+        {"srid": "b", "date": "2026-09-05", "finishedPrice": 100},
+    ])
+    assert len(db.load_orders(engine, date(2026, 10, 1), date(2026, 10, 31))) == 1

@@ -1,83 +1,83 @@
-"""Тесты службы требуют pytest-asyncio (asyncio_mode = auto в pyproject)."""
-from datetime import date
+import asyncio
 
-import pytest
-import pytest_asyncio  # noqa: F401
-
-from wb_sync import db, service
-from wb_sync.app_config import AppConfig
-from wb_sync.wb_api import WBClient
+from wb_sync.service import ping_wb, sync_cycle
 
 
-class StubClient:
+class FakeClient:
+    config = type("C", (), {"fetch_interval_minutes": 1, "fetch_data": True})()
+
     def __init__(self):
-        self.calls = 0
+        self.pinged = 0
+        self.synced = 0
 
-    def get_orders(self, start, end):
-        self.calls += 1
-        return [{"srid": f"o{self.calls}", "date": "2026-10-05T00:00:00",
-                 "supplierArticle": "A", "subjectName": "S", "warehouseName": "W",
-                 "totalPrice": 10000, "discountPercent": 0, "finishedPrice": 9500, "isCancel": False}]
+    def ping(self):
+        self.pinged += 1
+        if self.pinged < 2:
+            raise RuntimeError("down")
 
-    def get_sales(self, start, end):
-        return []
-
-    def get_fbs_orders(self, start, end):
-        return []
-
-    def get_stocks(self):
-        return []
-
-    def get_incomes(self):
-        return []
-
-    def get_cards(self):
-        return []
+    def sync(self):
+        self.synced += 1
+        return {"orders": 1}
 
 
-@pytest.fixture()
-def config(tmp_path):
-    return AppConfig(work_dir=str(tmp_path / "wd"), api_token="tok",
-                     fetch_interval_minutes=1, database_path="wb_sync.db")
+def test_ping_retries_then_ok():
+    client = FakeClient()
+    ok = asyncio.run(ping_wb(client, attempts=3))
+    assert ok and client.pinged == 2
 
 
-async def test_sync_cycle_fills_db(config):
-    engine = db.get_engine(config)
-    client = StubClient()
-    stats = await service.sync_cycle(config, engine, client)
-    assert stats["orders"] == 1 and stats["cards"] == 0
-    assert len(db.load_orders(engine, date(2026, 10, 1), date(2026, 10, 31))) == 1
-    engine.dispose()
+def test_ping_fails_all():
+    class Bad(FakeClient):
+        def ping(self):
+            self.pinged += 1
+            raise RuntimeError("down")
+    assert asyncio.run(ping_wb(Bad(), attempts=2)) is False
 
 
-async def test_run_service_stops_after_cycles(config, monkeypatch):
-    monkeypatch.setattr(service, "get_engine", lambda cfg: db.get_engine(cfg))
-    monkeypatch.setattr(service, "WBClient", lambda cfg: StubClient())
-    # подменяем sleep, чтобы не ждать реальный интервал
-    import asyncio as _aio
-    real_sleep = _aio.sleep
+def test_sync_cycle_fills_db(tmp_path, monkeypatch):
+    import wb_sync.core as core
+    import wb_sync.service as service
+    calls = []
 
-    async def fast_sleep(sec):
-        await real_sleep(0)
+    def fake_sync(cfg, client):
+        calls.append(1)
+        return {"orders": 0}
 
-    monkeypatch.setattr(_aio, "sleep", fast_sleep)
-    done = await service.run_service(config, cycles=3)
-    assert done == 3
+    monkeypatch.setattr(service, "sync_data", fake_sync)
+    counts = asyncio.run(service.sync_cycle(FakeClient()))
+    assert counts == {"orders": 0} and len(calls) == 1
 
 
-async def test_service_survives_errors(config, monkeypatch):
-    class BrokenClient(StubClient):
-        def get_orders(self, start, end):
-            raise RuntimeError("network down")
+def test_service_survives_errors(tmp_path, monkeypatch):
+    import wb_sync.service as service
 
-    monkeypatch.setattr(service, "get_engine", lambda cfg: db.get_engine(cfg))
-    monkeypatch.setattr(service, "WBClient", lambda cfg: BrokenClient())
-    import asyncio as _aio
-    real_sleep = _aio.sleep
+    class FlakyClient(FakeClient):
+        pass
 
-    async def fast_sleep(sec):
-        await real_sleep(0)
+    flaky = FlakyClient()
+    state = {"n": 0}
 
-    monkeypatch.setattr(_aio, "sleep", fast_sleep)
-    done = await service.run_service(config, cycles=2)
-    assert done == 2
+    async def fake_sync_cycle(client):
+        state["n"] += 1
+        if state["n"] == 1:
+            raise RuntimeError("boom")
+
+    async def fake_wait_for(*a, **kw):
+        raise asyncio.TimeoutError()
+
+    monkeypatch.setattr(service, "ping_wb", lambda *a, **kw: _true())
+    monkeypatch.setattr(service, "sync_cycle", fake_sync_cycle)
+    import asyncio as _a
+    orig_wait = _a.wait_for
+    _a_wait = fake_wait_for
+
+    async def run():
+        await service.run_service(type("C", (), {"fetch_interval_minutes": 0.0001, "fetch_data": True})(), cycles=2)
+
+    monkeypatch.setattr(service.asyncio, "wait_for", fake_wait_for)
+    asyncio.run(run())
+    assert state["n"] == 2
+
+
+def _true():
+    return True

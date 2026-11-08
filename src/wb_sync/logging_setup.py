@@ -1,36 +1,23 @@
+"""Настройка логирования: файл в work_dir + консоль."""
 import logging
 from logging.handlers import RotatingFileHandler
+from pathlib import Path
 
-from wb_sync.app_config import AppConfig
-
-LOG_FORMAT = "%(asctime)s %(levelname)s %(name)s: %(message)s"
 _configured = False
 
 
-def setup_logging(config: AppConfig) -> logging.Logger:
-    """Лог в work_dir/wb_sync.log (ротация 5 МБ x 5 файлов) + в консоль."""
+def setup_logging(log_path: Path) -> None:
     global _configured
-    root = logging.getLogger()
     if _configured:
-        for h in list(root.handlers):
-            root.removeHandler(h)
-        _configured = False
-
+        return
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    root = logging.getLogger()
     root.setLevel(logging.INFO)
-    fmt = logging.Formatter(LOG_FORMAT)
-
-    file_handler = RotatingFileHandler(
-        config.work_dir / "wb_sync.log",
-        maxBytes=5 * 1024 * 1024,
-        backupCount=5,
-        encoding="utf-8",
-    )
-    file_handler.setFormatter(fmt)
-    root.addHandler(file_handler)
-
-    console = logging.StreamHandler()
-    console.setFormatter(fmt)
-    root.addHandler(console)
-
+    fmt = logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
+    fh = RotatingFileHandler(log_path, maxBytes=5 * 1024 * 1024, backupCount=5, encoding="utf-8")
+    fh.setFormatter(fmt)
+    sh = logging.StreamHandler()
+    sh.setFormatter(fmt)
+    root.addHandler(fh)
+    root.addHandler(sh)
     _configured = True
-    return logging.getLogger("wb_sync")
