@@ -65,7 +65,7 @@ def test_service_survives_errors(tmp_path, monkeypatch):
     async def fake_wait_for(*a, **kw):
         raise asyncio.TimeoutError()
 
-    monkeypatch.setattr(service, "ping_wb", lambda *a, **kw: _true())
+    monkeypatch.setattr(service, "ping_wb", _async_true)
     monkeypatch.setattr(service, "sync_cycle", fake_sync_cycle)
     import asyncio as _a
     orig_wait = _a.wait_for
@@ -80,4 +80,7 @@ def test_service_survives_errors(tmp_path, monkeypatch):
 
 
 def _true():
+    return True
+
+async def _async_true(*args, **kwargs):
     return True

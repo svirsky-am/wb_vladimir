@@ -36,7 +36,7 @@ def test_fbs_upsert(tmp_path):
     engine = make_engine(make_cfg(tmp_path))
     assert db.upsert_fbs_orders(engine, [row], client) == 1
     assert db.upsert_fbs_orders(engine, [row], client) == 0
-    loaded = db.load_fbs_orders(engine, date(2026, 10, 1), date(2026, 10, 31))
+    loaded = db.load_fbs_orders(engine, date(2025, 10, 21), date(2025, 10, 29))
     assert loaded[0]["status"] == "Доставляется"
 
 

@@ -25,6 +25,8 @@ class FakeSession:
         self.responses = list(responses)
         self.calls = []
         self.headers = {}
+        # Обратите по контракту WBClient.session (getattr(_session, "s"))
+        self.s = self
 
     def request(self, method, url, **kwargs):
         self.calls.append((method, url, kwargs))

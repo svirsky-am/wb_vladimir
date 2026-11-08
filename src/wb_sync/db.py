@@ -63,6 +63,8 @@ def _parse_date(value) -> date | None:
     if isinstance(value, date):
         return value
     if isinstance(value, (int, float)):
+        if value > 1e12:  # миллисекунды
+            value = value / 1000
         return datetime.fromtimestamp(value, tz=timezone.utc).date()
     return date.fromisoformat(str(value)[:10])
 
@@ -160,6 +162,7 @@ def upsert_cards(engine, rows: list) -> int:
 def status_to_ru_obj(status: str, is_cancel: bool) -> str:
     ru = {"new": "Ожидает сборки", "confirm": "Готов к отгрузке",
           "complete": "Доставляется", "sent_to_carrier": "Доставляется",
+          "delivering": "Доставляется",
           "delivered": "Доставлен", "cancel": "Отменен", "cancellation": "Отменен",
           }.get((status or "").lower(), status or "неизвестно")
     if is_cancel:

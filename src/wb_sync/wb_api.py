@@ -17,10 +17,10 @@ STATUS_RU = {
     "new": "Ожидает сборки",
     "confirm": "Готов к отгрузке",
     "complete": "Доставляется",
-    "sent_to_carrier": "Доставляется",
     "delivered": "Доставлен",
     "cancel": "Отменен",
     "cancellation": "Отменен",
+    "delivering": "Доставляется",
 }
 
 
@@ -72,17 +72,27 @@ class WBClient:
     def _host(self, base: str) -> str:
         if not self.config.sandbox:
             return base
-        return base.replace("wildberries.ru", "-sandbox.wildberries.ru")
+        # statistics-api.wildberries.ru -> statistics-api-sandbox.wildberries.ru
+        return base.replace(".wildberries.ru", "-sandbox.wildberries.ru")
 
     # --- сессия и троттлинг ----------------------------------------------
     @property
     def session(self) -> requests.Session:
+        # разрешаем переходить у тестов через singledispatch/patch.object
         s = getattr(self._session, "s", None)
         if s is None:
             s = requests.Session()
             s.headers.update({"Authorization": self.config.api_token, "Accept": "application/json"})
             self._session.s = s
         return s
+
+    @session.setter
+    def session(self, value: requests.Session) -> None:
+        self._session.s = value
+
+    @session.deleter
+    def session(self) -> None:
+        self._session.s = None
 
     def _throttle(self) -> None:
         interval = max(self.config.min_request_interval, 0.0)
@@ -120,7 +130,7 @@ class WBClient:
                 resp = self.session.request(method, url, params=params, json=json_body, timeout=60)
                 elapsed = time.monotonic() - started
                 if resp.status_code == 200:
-                    logger.info("%s -> 200 (%.1f КБ, %.2f с)", label, len(resp.content) / 1024, elapsed)
+                    logger.info("%s → 200 (%.1f КБ, %.2f с)", label, len(resp.content) / 1024, elapsed)
                     return resp.json()
                 if resp.status_code == 429 or resp.status_code >= 500:
                     logger.info("Попытка %d/%d %s — HTTP %d (%.2f с)", attempt, total, label, resp.status_code, elapsed)
@@ -139,6 +149,7 @@ class WBClient:
                 last_err = str(exc)
                 delay = self.config.retry_base_delay * (2 ** (attempt - 1))
                 time.sleep(delay)
+        logger.error("Запрос не удался окончательно: %s", label)
         raise RuntimeError(f"Запрос не удался после {total} попыток: {label} — {last_err}")
 
     # --- ping -------------------------------------------------------------
