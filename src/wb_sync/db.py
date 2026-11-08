@@ -1,7 +1,7 @@
 """SQLite через SQLAlchemy: orders, sales, fbs_orders, cards. Апсерт по ключу."""
 from datetime import date, datetime, timezone
 
-from sqlalchemy import (Boolean, Column, Date, Float, Integer, String, create_engine, select)
+from sqlalchemy import (Boolean, Column, Date, Float, Integer, String, create_engine, select, text)
 from sqlalchemy.orm import Session, declarative_base
 
 Base = declarative_base()
@@ -51,9 +51,34 @@ class Card(Base):
     raw = Column(String)
 
 
+def _ensure_schema(engine) -> None:
+    """Проверка и дополнение колонок таблиц, если модель изменилась."""
+    with engine.begin() as conn:
+        for table, model_cls in (
+            ("orders", Order),
+            ("sales", Sale),
+            ("fbs_orders", FbsOrder),
+            ("cards", Card),
+        ):
+            # Если таблицы нет — создать
+            if not conn.dialect.has_table(conn, table):
+                model_cls.__table__.create(conn)
+                continue
+            # Получить существующие колонки
+            columns_info = conn.dialect.get_columns(conn, table)
+            existing = {c["name"] for c in columns_info}
+            # Добавить отсутствующие колонки
+            for col in model_cls.__table__.columns:
+                if col.name not in existing:
+                    conn.execute(text(
+                        f"ALTER TABLE {table} ADD COLUMN {col.name} {col.type}"
+                    ))
+
+
 def make_engine(config) -> object:
     engine = create_engine(f"sqlite:///{config.database_path}")
     Base.metadata.create_all(engine)
+    _ensure_schema(engine)
     return engine
 
 

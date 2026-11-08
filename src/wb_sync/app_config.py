@@ -18,7 +18,7 @@ class AppConfig:
     sandbox: bool = False            # env: WB_SANDBOX=1 — *-api-sandbox.wildberries.ru
     min_request_interval: float = 1.0  # env: MIN_REQUEST_INTERVAL — троттлинг, с
     max_retries: int = 5             # env: MAX_RETRIES — число повторов при 429/5xx
-    retry_base_delay: float = 5.0    # env: RETRY_BASE_DELAY — база экспоненты, с
+    retry_base_delay: float = 60.0 * 30    # env: RETRY_BASE_DELAY — база экспоненты, с
     log_file: str = "wb_sync.log"    # относительно work_dir
 
     def __post_init__(self):
