@@ -1,237 +1,199 @@
-"""SQLite через SQLAlchemy: orders, sales, fbs_orders, cards."""
-from __future__ import annotations
+"""SQLite через SQLAlchemy 2.0: orders, sales, fbs_orders, cards."""
 
-import json
+import logging
 from datetime import date, datetime, timezone
 
-from sqlalchemy import Column, Integer, String, Float, Boolean, Text
-from sqlalchemy.orm import DeclarativeBase, Session
+from sqlalchemy import (
+    String, Integer, Float, Boolean, DateTime, Date, UniqueConstraint, select,
+)
+from sqlalchemy import create_engine
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, sessionmaker
 
-from .cards import normalize_card
+logger = logging.getLogger("wb_sync.db")
 
 
 class Base(DeclarativeBase):
     pass
 
 
-class OrderRow(Base):
+class Order(Base):
     __tablename__ = "orders"
-    srid = Column(String, primary_key=True)
-    date = Column(String, index=True)
-    nm_id = Column(Integer)
-    article = Column(String)
-    subject = Column(String)
-    brand = Column(String)
-    warehouse_name = Column(String)
-    total_price = Column(Float)
-    discount_percent = Column(Integer)
-    finished_price = Column(Float)
-    is_cancel = Column(Boolean)
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    srid: Mapped[str] = mapped_column(String, unique=True)
+    date: Mapped[str] = mapped_column(String)
+    article: Mapped[str] = mapped_column(String)
+    article_name: Mapped[str] = mapped_column(String, default="")
+    warehouse: Mapped[str] = mapped_column(String, default="")
+    quantity: Mapped[int] = mapped_column(Integer, default=1)
+    price: Mapped[float] = mapped_column(Float, default=0.0)
+    status: Mapped[str] = mapped_column(String, default="")
+    is_cancel: Mapped[bool] = mapped_column(Boolean, default=False)
 
 
-class SaleRow(Base):
+class Sale(Base):
     __tablename__ = "sales"
-    sale_id = Column(String, primary_key=True)
-    srid = Column(String, index=True)
-    date = Column(String, index=True)
-    nm_id = Column(Integer)
-    article = Column(String)
-    subject = Column(String)
-    brand = Column(String)
-    warehouse_name = Column(String)
-    finished_price = Column(Float)
-    is_cancel = Column(Boolean)
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    sale_id: Mapped[str] = mapped_column(String, unique=True)
+    date: Mapped[str] = mapped_column(String)
+    srid: Mapped[str] = mapped_column(String, default="")
+    article: Mapped[str] = mapped_column(String)
+    article_name: Mapped[str] = mapped_column(String, default="")
+    finished_price: Mapped[float] = mapped_column(Float, default=0.0)
+    is_cancel: Mapped[bool] = mapped_column(Boolean, default=False)
 
 
-class FbsOrderRow(Base):
+class FbsOrder(Base):
     __tablename__ = "fbs_orders"
-    srid = Column(String, primary_key=True)
-    created_at = Column(String, index=True)
-    nm_id = Column(Integer)
-    article = Column(String)
-    price = Column(Float)
-    status = Column(String)
-    raw = Column(Text)
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    rid: Mapped[str] = mapped_column(String, unique=True)
+    nm_id: Mapped[int] = mapped_column(Integer, default=0)
+    created_at: Mapped[str] = mapped_column(String, default="")
+    price: Mapped[float] = mapped_column(Float, default=0.0)
+    status: Mapped[str] = mapped_column(String, default="")
+    is_cancel: Mapped[bool] = mapped_column(Boolean, default=False)
 
 
-class CardRow(Base):
+class Card(Base):
     __tablename__ = "cards"
-    nm_id = Column(Integer, primary_key=True)
-    imt_id = Column(Integer)
-    article = Column(String, index=True)
-    title = Column(String)
-    brand = Column(String)
-    raw = Column(Text)
-    updated_at = Column(String)
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    nm_id: Mapped[int] = mapped_column(Integer, unique=True)
+    article: Mapped[str] = mapped_column(String, default="")
+    title: Mapped[str] = mapped_column(String, default="")
+    brand: Mapped[str] = mapped_column(String, default="")
+    category: Mapped[str] = mapped_column(String, default="")
+    updated_at: Mapped[str] = mapped_column(String, default="")
+    raw: Mapped[str] = mapped_column(String, default="{}")
 
 
-def get_engine(config):
-    from sqlalchemy import create_engine
-    engine = create_engine(f"sqlite:///{config.database_path}")
+def make_engine(config):
+    return create_engine(f"sqlite:///{config.database_path}")
+
+
+def init_db(engine):
     Base.metadata.create_all(engine)
-    return engine
 
 
-def _d(s):
-    return datetime.fromisoformat(s[:10]).date() if s else None
+# ----- апсерты: идемпотентны, дубли исключены -----
+def _upsert(session, model, unique_attr, unique_value, values: dict):
+    obj = session.execute(
+        select(model).where(getattr(model, unique_attr) == unique_value)
+    ).scalar_one_or_none()
+    if obj is None:
+        session.add(model(**values))
+        return 1
+    for k, v in values.items():
+        setattr(obj, k, v)
+    return 0
 
 
-# ---------- orders ----------
-def upsert_orders(engine, rows) -> int:
-    n = 0
-    with Session(engine) as s:
-        for row in rows:
-            srid = str(row.get("srid") or "")
-            if not srid:
-                continue
-            obj = s.get(OrderRow, srid)
-            if obj is None:
-                obj = OrderRow(srid=srid)
-                s.add(obj)
-                n += 1
-            obj.date = row.get("date") or ""
-            obj.nm_id = row.get("nmId")
-            obj.article = row.get("supplierArticle") or ""
-            obj.subject = row.get("subjectName") or ""
-            obj.brand = row.get("brandName") or ""
-            obj.warehouse_name = row.get("warehouseName") or ""
-            # v1 отдаёт цены в копейках -> конвертируем в рубли
-            obj.total_price = (row.get("totalPrice") or 0) / 100
-            obj.discount_percent = row.get("discountPercent") or 0
-            obj.finished_price = (row.get("finishedPrice") or 0) / 100
-            obj.is_cancel = bool(row.get("isCancel"))
-        s.commit()
-    return n
-
-
-def load_orders(engine, date_from: date, date_to: date):
-    out = []
-    with Session(engine) as s:
-        q = s.query(OrderRow).filter(OrderRow.date.is_not(None))
-        for r in q.all():
-            d = _d(r.date)
-            if d and date_from <= d <= date_to:
-                out.append(r.__dict__ | {"_sa": None} if False else {
-                    "srid": r.srid, "date": r.date, "nmId": r.nm_id, "supplierArticle": r.article,
-                    "subjectName": r.subject, "brandName": r.brand, "warehouseName": r.warehouse_name,
-                    "totalPrice": r.total_price, "discountPercent": r.discount_percent,
-                    "finishedPrice": r.finished_price, "isCancel": r.is_cancel,
-                })
-    return out
-
-
-# ---------- sales ----------
-def upsert_sales(engine, rows) -> int:
-    n = 0
-    with Session(engine) as s:
-        for row in rows:
-            sale_id = str(row.get("saleID") or "")
-            if not sale_id:
-                continue
-            obj = s.get(SaleRow, sale_id)
-            if obj is None:
-                obj = SaleRow(sale_id=sale_id)
-                s.add(obj)
-                n += 1
-            obj.srid = str(row.get("srid") or "")
-            obj.date = row.get("date") or ""
-            obj.nm_id = row.get("nmId")
-            obj.article = row.get("supplierArticle") or ""
-            obj.subject = row.get("subjectName") or ""
-            obj.brand = row.get("brandName") or ""
-            obj.warehouse_name = row.get("warehouseName") or ""
-            # v1 отдаёт цены в копейках -> конвертируем в рубли
-            obj.finished_price = (row.get("finishedPrice") or 0) / 100
-            obj.is_cancel = bool(row.get("isCancel"))
-        s.commit()
-    return n
-
-
-def load_sales(engine, date_from: date, date_to: date):
-    out = []
-    with Session(engine) as s:
-        for r in s.query(SaleRow).all():
-            d = _d(r.date)
-            if d and date_from <= d <= date_to:
-                out.append({
-                    "saleID": r.sale_id, "srid": r.srid, "date": r.date, "nmId": r.nm_id,
-                    "supplierArticle": r.article, "subjectName": r.subject, "brandName": r.brand,
-                    "warehouseName": r.warehouse_name, "finishedPrice": r.finished_price,
-                    "isCancel": r.is_cancel,
-                })
-    return out
-
-
-# ---------- fbs_orders ----------
-def upsert_fbs_orders(engine, rows, client) -> int:
-    n = 0
-    with Session(engine) as s:
-        for row in rows:
-            srid = str(row.get("rid") or "")
-            if not srid:
-                continue
-            obj = s.get(FbsOrderRow, srid)
-            if obj is None:
-                obj = FbsOrderRow(srid=srid)
-                s.add(obj)
-                n += 1
-            ms = row.get("createdAt") or 0
-            obj.created_at = datetime.fromtimestamp(ms / 1000, tz=timezone.utc).isoformat()
-            obj.nm_id = row.get("nmId")
-            obj.article = str(row.get("skus", [""])[0]) if row.get("skus") else ""
-            obj.price = row.get("price") or 0  # v3 отдаёт цену сразу в рублях
-            obj.status = client.normalize_status(row)
-            obj.raw = json.dumps(row, ensure_ascii=False)
-        s.commit()
-    return n
-
-
-def load_fbs_orders(engine, date_from: date, date_to: date):
-    out = []
-    with Session(engine) as s:
-        for r in s.query(FbsOrderRow).all():
-            d = _d(r.created_at)
-            if d and date_from <= d <= date_to:
-                out.append({
-                    "srid": r.srid, "createdAt": r.created_at, "nmId": r.nm_id,
-                    "article": r.article, "price": r.price, "status": r.status, "raw": r.raw,
-                })
-    return out
-
-
-# ---------- cards ----------
-def upsert_cards(engine, cards) -> int:
-    n = 0
-    with Session(engine) as s:
-        for card in cards:
-            nm_id = card.get("nmID")
-            if nm_id is None:
-                continue
-            obj = s.get(CardRow, nm_id)
-            if obj is None:
-                obj = CardRow(nm_id=nm_id)
-                s.add(obj)
-                n += 1
-            norm = normalize_card(card)
-            obj.imt_id = norm["imt_id"]
-            obj.article = norm["article"] or ""
-            obj.title = norm["title"]
-            obj.brand = norm["brand"]
-            obj.raw = json.dumps(card, ensure_ascii=False)
-            obj.updated_at = datetime.now(tz=timezone.utc).isoformat()
-        s.commit()
-    return n
-
-
-def load_cards(engine, article: str | None = None):
-    out = []
-    with Session(engine) as s:
-        q = s.query(CardRow)
-        if article:
-            q = q.filter(CardRow.article == article)
-        for r in q.all():
-            out.append({
-                "nmID": r.nm_id, "imtID": r.imt_id, "vendorCode": r.article,
-                "title": r.title, "brand": r.brand, "raw": r.raw, "updated_at": r.updated_at,
+def upsert_orders(engine, rows):
+    added = 0
+    with sessionmaker(engine)() as s:
+        for r in rows:
+            added += _upsert(s, Order, "srid", r["srid"], {
+                "srid": r["srid"],
+                "date": r.get("date", ""),
+                "article": r.get("article", "") or r.get("supplierArticle", ""),
+                "article_name": r.get("article_name", ""),
+                "warehouse": r.get("warehouseName", ""),
+                "quantity": int(r.get("quantity", 1) or 1),
+                "price": r.get("price", 0.0),
+                "status": r.get("status", ""),
+                "is_cancel": bool(r.get("isCancel", False)),
             })
-    return out
+        s.commit()
+    logger.info("orders: %d новых записей из %d", added, len(rows))
+    return added
+
+
+def upsert_sales(engine, rows):
+    added = 0
+    with sessionmaker(engine)() as s:
+        for r in rows:
+            added += _upsert(s, Sale, "sale_id", r["saleID"], {
+                "sale_id": r["saleID"],
+                "date": r.get("date", ""),
+                "srid": r.get("srid", ""),
+                "article": r.get("article", "") or r.get("supplierArticle", ""),
+                "article_name": r.get("article_name", ""),
+                "finished_price": r.get("finishedPrice", 0) / 100.0,  # копейки -> рубли
+                "is_cancel": bool(r.get("isCancel", False)),
+            })
+        s.commit()
+    logger.info("sales: %d новых записей из %d", added, len(rows))
+    return added
+
+
+def upsert_fbs_orders(engine, rows, client):
+    added = 0
+    with sessionmaker(engine)() as s:
+        for r in rows:
+            ts = r.get("createdAt")
+            created = (
+                datetime.fromtimestamp(ts / 1000, tz=timezone.utc).isoformat()
+                if isinstance(ts, (int, float)) else str(ts or "")
+            )
+            added += _upsert(s, FbsOrder, "rid", r["rid"], {
+                "rid": r["rid"],
+                "nm_id": int(r.get("nmId", 0) or 0),
+                "created_at": created,
+                "price": r.get("price", 0.0),  # v3 отдаёт рубли
+                "status": client.normalize_v3_status(r) if hasattr(client, "normalize_v3_status") else normalize_v3_status(r),
+                "is_cancel": bool((r.get("statuses") or {}).get("isCancel", False)),
+            })
+        s.commit()
+    logger.info("fbs_orders: %d новых записей из %d", added, len(rows))
+    return added
+
+
+def upsert_cards(engine, cards):
+    import json as _json
+    added = 0
+    with sessionmaker(engine)() as s:
+        for c in cards:
+            added += _upsert(s, Card, "nm_id", c.get("nmID"), {
+                "nm_id": c.get("nmID"),
+                "article": c.get("vendorCode", ""),
+                "title": c.get("title", ""),
+                "brand": c.get("brand", ""),
+                "category": c.get("category", ""),
+                "updated_at": c.get("updatedAt", ""),
+                "raw": _json.dumps(c, ensure_ascii=False),
+            })
+        s.commit()
+    logger.info("cards: %d новых карточек из %d", added, len(cards))
+    return added
+
+
+def load_orders(engine, d_from: date, d_to: date):
+    with sessionmaker(engine)() as s:
+        rows = s.execute(select(Order).where(Order.date >= d_from.isoformat(),
+                                             Order.date <= d_to.isoformat())).scalars().all()
+        return [dict(srid=r.srid, date=r.date, article=r.article,
+                     article_name=r.article_name, warehouseName=r.warehouse,
+                     quantity=r.quantity, price=r.price, status=r.status,
+                     isCancel=r.is_cancel) for r in rows]
+
+
+def load_sales(engine, d_from: date, d_to: date):
+    with sessionmaker(engine)() as s:
+        rows = s.execute(select(Sale).where(Sale.date >= d_from.isoformat(),
+                                            Sale.date <= d_to.isoformat())).scalars().all()
+        return [dict(saleID=r.sale_id, date=r.date, srid=r.srid, article=r.article,
+                     article_name=r.article_name, finished_price=r.finished_price,
+                     isCancel=r.is_cancel) for r in rows]
+
+
+def load_fbs_orders(engine, d_from: date, d_to: date):
+    with sessionmaker(engine)() as s:
+        rows = s.execute(select(FbsOrder).where(FbsOrder.created_at >= d_from.isoformat(),
+                                                FbsOrder.created_at <= d_to.isoformat())).scalars().all()
+        return [dict(rid=r.rid, nmId=r.nm_id, createdAt=r.created_at,
+                     price=r.price, status=r.status, isCancel=r.is_cancel) for r in rows]
+
+
+def load_cards(engine):
+    with sessionmaker(engine)() as s:
+        rows = s.execute(select(Card)).scalars().all()
+        return [dict(nmID=r.nm_id, article=r.article, title=r.title,
+                     brand=r.brand, category=r.category, updatedAt=r.updated_at) for r in rows]

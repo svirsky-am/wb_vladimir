@@ -1,5 +1,9 @@
-.staff
+.venv/
+__pycache__/
+*.pyc
 work_dir
 .tmp
+.staff
+dist/
+uv.lock.bak
 wd_cfg*/wb_sync.log
-tests/__pycache__/test_cards.cpython-314-pytest-9.2.0.pyc

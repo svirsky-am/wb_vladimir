@@ -1,56 +1,65 @@
-"""asyncio-служба: периодический фетч WB -> SQLite. Интервал берётся из AppConfig."""
-from __future__ import annotations
+"""asyncio-служба: периодический фетч данных по конфигу."""
 
 import asyncio
+import logging
 import signal
+import sys
+from datetime import date, timedelta
 
-from .app_config import AppConfig
-from .core import sync_cards, sync_data
-from .db import get_engine
-from .logging_setup import setup_logging
-from .wb_api import WBClient
+from wb_sync.app_config import AppConfig
+from wb_sync import db
+from wb_sync.logging_setup import setup_logging
+from wb_sync.wb_api import WBClient
+from wb_sync.core import sync_data
 
-
-async def sync_cycle(config, engine, client) -> dict:
-    """Один цикл: выгрузка данных + карточек (в отдельном потоке, чтобы не блокировать loop)."""
-    stats = await asyncio.to_thread(sync_data, config, engine, client)
-    stats.update(await asyncio.to_thread(sync_cards, config, engine, client))
-    return stats
+logger = logging.getLogger("wb_sync.service")
 
 
-async def run_service(config, cycles: int | None = None):
-    """Бесконечный цикл sync -> sleep(fetch_interval_minutes). cycles — для тестов.
+def sync_cycle(config, engine, client):
+    d_to = date.today()
+    d_from = d_to - timedelta(days=config.fetch_window_days - 1)
+    return sync_data(config, engine, client, d_from, d_to)
 
-    Graceful shutdown по SIGINT/SIGTERM.
-    """
-    engine = get_engine(config)
-    client = WBClient(config)
-    stop = asyncio.Event()
 
-    def handle_signal():
-        stop.set()
-
+async def run_service(config, engine, client, max_cycles=None):
+    """Цикл: sync -> sleep(fetch_interval_minutes). Ошибка цикла не роняет службу."""
     loop = asyncio.get_running_loop()
+    stop = asyncio.Event()
     for sig in (signal.SIGINT, signal.SIGTERM):
         try:
-            loop.add_signal_handler(sig, handle_signal)
+            loop.add_signal_handler(sig, stop.set)
         except NotImplementedError:
-            pass  # Windows: отрабатывает KeyboardInterrupt
+            pass  # Windows / не-основной поток
 
-    done = 0
-    try:
-        while not stop.is_set() and (cycles is None or done < cycles):
-            try:
-                stats = await sync_cycle(config, engine, client)
-                print(f"[service] цикл {done + 1}: {stats}")
-            except Exception as exc:  # noqa: BLE001 — служба переживает ошибку цикла
-                print(f"[service] ошибка цикла: {exc}")
-            done += 1
-            if cycles is None or done < cycles:
-                try:
-                    await asyncio.wait_for(stop.wait(), timeout=config.fetch_interval_minutes * 60)
-                except asyncio.TimeoutError:
-                    pass
-    finally:
-        engine.dispose()
-    return done
+    logger.info("Служба запущена: интервал %.0f мин, fetch_data=%s",
+                config.fetch_interval_minutes, config.fetch_data)
+    cycles = 0
+    while not stop.is_set():
+        cycles += 1
+        logger.info("Цикл %d: начало", cycles)
+        try:
+            result = await asyncio.to_thread(sync_cycle, config, engine, client)
+            logger.info("Цикл %d: готово %s", cycles, result)
+        except Exception:
+            logger.exception("Цикл %d: ошибка синхронизации", cycles)
+        if max_cycles is not None and cycles >= max_cycles:
+            logger.info("Достигнут лимит циклов (%d), остановка", max_cycles)
+            break
+        try:
+            await asyncio.wait_for(stop.wait(), timeout=config.fetch_interval_minutes * 60)
+        except asyncio.TimeoutError:
+            pass
+    logger.info("Служба остановлена")
+
+
+def main():
+    config = AppConfig()
+    setup_logging(config)
+    engine = db.make_engine(config)
+    db.init_db(engine)
+    client = WBClient(config)
+    asyncio.run(run_service(config, engine, client))
+
+
+if __name__ == "__main__":
+    main()

@@ -1,25 +1,35 @@
-"""Общая логика для CLI, службы и MCP-сервера."""
-from __future__ import annotations
+"""Общая логика: синхронизация данных и сборка реестра."""
 
-from datetime import date, timedelta
+import logging
+from datetime import date
 
-from . import db
-from .wb_api import WBClient
+from wb_sync import db
+from wb_sync.reports import build_registry_xlsx
 
-
-def sync_data(config, engine, client: WBClient) -> dict:
-    end = date.today()
-    start = end - timedelta(days=config.fetch_window_days - 1)
-    stats = {}
-    orders = client.get_orders(start, end)
-    stats["orders"] = db.upsert_orders(engine, orders)
-    sales = client.get_sales(start, end)
-    stats["sales"] = db.upsert_sales(engine, sales)
-    fbs = client.get_fbs_orders(start, end)
-    stats["fbs_orders"] = db.upsert_fbs_orders(engine, fbs, client)
-    return stats
+logger = logging.getLogger("wb_sync.core")
 
 
-def sync_cards(config, engine, client: WBClient) -> dict:
-    cards = client.get_cards()
-    return {"cards": db.upsert_cards(engine, cards)}
+def sync_data(config, engine, client, d_from: date, d_to: date):
+    """Полный цикл выгрузки: v1 statistics + v3 FBS + карточки -> БД."""
+    logger.info("Синхронизация %s..%s (fetch_data=%s)", d_from, d_to, config.fetch_data)
+    result = {}
+    result["orders"] = db.upsert_orders(engine, client.get_orders(d_from, d_to))
+    result["sales"] = db.upsert_sales(engine, client.get_sales(d_from, d_to))
+    result["fbs_orders"] = db.upsert_fbs_orders(engine, client.get_v3_orders(d_from, d_to), client)
+    try:
+        result["cards"] = db.upsert_cards(engine, client.get_cards())
+    except Exception:
+        logger.exception("Не удалось выгрузить карточки — пропускаю, продолжаю")
+        result["cards"] = 0
+    logger.info("Синхронизация завершена: %s", result)
+    return result
+
+
+def build_registry_report(config, engine, client, d_from: date, d_to: date, out_path):
+    orders = db.load_orders(engine, d_from, d_to)
+    fbs = {r["rid"]: r for r in db.load_fbs_orders(engine, d_from, d_to)}
+    sales = db.load_sales(engine, d_from, d_to)
+    return build_registry_xlsx(
+        orders, sales, fbs, out_path,
+        shop_name="ИП Олейник",
+    )

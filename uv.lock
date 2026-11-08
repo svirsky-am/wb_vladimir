@@ -6,10 +6,10 @@ resolution-markers = [
     "python_full_version >= '3.14' and sys_platform == 'emscripten'",
     "python_full_version >= '3.14' and sys_platform != 'emscripten' and sys_platform != 'win32'",
     "python_full_version >= '3.12' and python_full_version < '3.14' and sys_platform == 'win32'",
-    "python_full_version < '3.12' and sys_platform == 'win32'",
     "python_full_version >= '3.12' and python_full_version < '3.14' and sys_platform == 'emscripten'",
-    "python_full_version < '3.12' and sys_platform == 'emscripten'",
     "python_full_version >= '3.12' and python_full_version < '3.14' and sys_platform != 'emscripten' and sys_platform != 'win32'",
+    "python_full_version < '3.12' and sys_platform == 'win32'",
+    "python_full_version < '3.12' and sys_platform == 'emscripten'",
     "python_full_version < '3.12' and sys_platform != 'emscripten' and sys_platform != 'win32'",
 ]
 
@@ -1475,8 +1475,8 @@ wheels = [
 
 [[package]]
 name = "wb-sync"
-version = "0.2.0"
-source = { editable = "." }
+version = "0.3.0"
+source = { virtual = "." }
 dependencies = [
     { name = "mcp" },
     { name = "openpyxl" },
@@ -1497,7 +1497,7 @@ sheets = [
 
 [package.metadata]
 requires-dist = [
-    { name = "google-auth", marker = "extra == 'sheets'", specifier = ">=2.28" },
+    { name = "google-auth", marker = "extra == 'sheets'", specifier = ">=2.0" },
     { name = "gspread", marker = "extra == 'sheets'", specifier = ">=6.0" },
     { name = "mcp", specifier = ">=1.2" },
     { name = "openpyxl", specifier = ">=3.1" },
