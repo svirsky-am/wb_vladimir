@@ -1,3 +1,5 @@
 .staff
 work_dir
 .tmp
+wd_cfg*/wb_sync.log
+tests/__pycache__/test_cards.cpython-314-pytest-9.2.0.pyc

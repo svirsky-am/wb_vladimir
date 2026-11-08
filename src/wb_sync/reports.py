@@ -1,134 +1,76 @@
-"""Генерация xlsx-реестра в формате «Реестр Озон/ВБ» + сводные листы.
+"""Генерация xlsx: Реестр + сводные листы."""
+from __future__ import annotations
 
-Функции принимают готовые строки (list[dict]) — их можно собрать из БД
-или из тестовых моков, sqlalchemy здесь не нужен.
-"""
-
-from datetime import datetime
-from pathlib import Path
+from collections import defaultdict
+from datetime import date
 
 from openpyxl import Workbook
-from openpyxl.styles import Alignment, Font, PatternFill
+from openpyxl.styles import Font, PatternFill
 from openpyxl.utils import get_column_letter
 
-HEADER = [
-    "Магазин", "Номер отправления", "Статус", "Принят",
-    "Кол-во, артикул  Название товара", "Стоимость", "Склад",
-]
 
-_MONEY_FMT = "#,##0.00 ₽"
-
-
-def _parse_date(value: str) -> str:
-    if not value:
-        return ""
-    try:
-        return datetime.fromisoformat(value).strftime("%d.%m.%Y")
-    except ValueError:
-        return value
-
-
-def build_registry_rows(orders: list[dict], fbs_by_srid: dict[str, dict] | None = None) -> list[dict]:
-    fbs_by_srid = fbs_by_srid or {}
+def build_registry_rows(orders, fbs_by_srid):
     rows = []
     for o in orders:
-        srid = str(o.get("srid", ""))
+        srid = str(o.get("srid") or "")
         fbs = fbs_by_srid.get(srid)
-        if fbs:
-            status = fbs.get("status") or ""
+        if fbs and fbs.get("status"):
+            status = fbs["status"]
         else:
-            status = "Отменен" if o.get("is_cancel") else "Готов к отгрузке"
-        article = o.get("article") or ""
-        name = o.get("goods_name") or ""
-        rows.append(
-            {
-                "Магазин": o.get("office") or "ИП",
-                "Номер отправления": srid,
-                "Статус": status,
-                "Принят": _parse_date(o.get("date")),
-                "Кол-во, артикул  Название товара": f"1 шт, {article}    {name}",
-                "Стоимость": o.get("finished_price") or 0.0,
-                "Склад": o.get("warehouse") or "",
-            }
-        )
+            status = "Отменен" if o.get("isCancel") else "Готов к отгрузке"
+        rows.append({
+            "Магазин": "WB",
+            "Номер отправления": srid,
+            "Статус": status,
+            "Принят": (o.get("date") or "")[:10],
+            "Кол-во, артикул": f"1 шт, {o.get('supplierArticle') or ''}",
+            "Название товара": o.get("subjectName") or "",
+            "Стоимость": o.get("finishedPrice") or 0.0,
+            "Склад": o.get("warehouseName") or "",
+        })
+    rows.sort(key=lambda r: r["Принят"], reverse=True)
     return rows
 
 
-def _autowidth(ws, min_width: int = 10, max_width: int = 60):
-    for idx, cell in enumerate(ws[1], start=1):
-        col_values = [str(ws.cell(row=r, column=idx).value or "") for r in range(1, ws.max_row + 1)]
-        width = max(min(len(v) for v in col_values) * 1.0, min_width)
-        ws.column_dimensions[get_column_letter(idx)].width = min(
-            max(width, max(len(str(cell.value or "")) + 2, min_width)), max_width
-        )
-
-
-def write_registry_xlsx(
-    rows: list[dict],
-    out_path: str | Path,
-    sales: list[dict] | None = None,
-) -> Path:
+def build_registry_xlsx(rows, date_from: date, date_to: date, out_path: str) -> str:
     wb = Workbook()
-
-    # Лист «Реестр»
     ws = wb.active
     ws.title = "Реестр"
-    ws.append(HEADER)
-    header_fill = PatternFill("solid", fgColor="DDEBF7")
+    headers = ["Магазин", "Номер отправления", "Статус", "Принят", "Кол-во, артикул",
+               "Название товара", "Стоимость", "Склад"]
+    ws.append(headers)
     for cell in ws[1]:
         cell.font = Font(bold=True)
-        cell.fill = header_fill
-        cell.alignment = Alignment(vertical="center")
-    for row in rows:
-        ws.append([row.get(col, "") for col in HEADER])
-    for r in range(2, ws.max_row + 1):
-        ws.cell(row=r, column=6).number_format = _MONEY_FMT
-    _autowidth(ws)
+        cell.fill = PatternFill("solid", fgColor="DDDDDD")
+    for r in rows:
+        ws.append([r[h] for h in headers])
+    for i, w in enumerate([14, 24, 18, 12, 40, 60, 12, 22], start=1):
+        ws.column_dimensions[get_column_letter(i)].width = w
 
-    # Лист «По дням»
-    if sales:
-        daily = {}
-        for s in sales:
-            key = s.get("date") or ""
-            agg = daily.setdefault(key, {"count": 0, "revenue": 0.0, "cancels": 0})
-            agg["count"] += 1
-            agg["revenue"] += s.get("finished_price") or 0.0
-            agg["cancels"] += int(bool(s.get("is_cancel")))
-        ws2 = wb.create_sheet("По дням")
-        ws2.append(["Дата", "Выкуплено позиций", "Выручка", "Отмены"])
-        for cell in ws2[1]:
-            cell.font = Font(bold=True)
-            cell.fill = header_fill
-        for key in sorted(daily):
-            d = daily[key]
-            ws2.append([_parse_date(key), d["count"], d["revenue"], d["cancels"]])
-        for r in range(2, ws2.max_row + 1):
-            ws2.cell(row=r, column=3).number_format = _MONEY_FMT
-        _autowidth(ws2)
+    by_day = defaultdict(lambda: {"cnt": 0, "sum": 0.0, "cancel": 0})
+    by_art = defaultdict(lambda: {"cnt": 0, "sum": 0.0, "cancel": 0})
+    for r in rows:
+        key_day = r["Принят"]
+        key_art = r["Кол-во, артикул"].split(", ", 1)[-1]
+        v = r["Стоимость"] or 0.0
+        for agg, key in ((by_day, key_day), (by_art, key_art)):
+            agg[key]["cnt"] += 1
+            agg[key]["sum"] += 0 if r["Статус"] == "Отменен" else v
+            if r["Статус"] == "Отменен":
+                agg[key]["cancel"] += 1
 
-        # Лист «По артикулам»
-        arts = {}
-        for s in sales:
-            key = s.get("article") or ""
-            agg = arts.setdefault(key, {"count": 0, "revenue": 0.0, "cancels": 0, "name": s.get("goods_name") or ""})
-            agg["count"] += 1
-            agg["revenue"] += s.get("finished_price") or 0.0
-            agg["cancels"] += int(bool(s.get("is_cancel")))
-        ws3 = wb.create_sheet("По артикулам")
-        ws3.append(["Артикул", "Название товара", "Выкуплено позиций", "Выручка", "Средняя цена", "Отмены"])
-        for cell in ws3[1]:
-            cell.font = Font(bold=True)
-            cell.fill = header_fill
-        for key in sorted(arts):
-            a = arts[key]
-            avg = round(a["revenue"] / a["count"], 2) if a["count"] else 0.0
-            ws3.append([key, a["name"], a["count"], a["revenue"], avg, a["cancels"]])
-        for r in range(2, ws3.max_row + 1):
-            ws3.cell(row=r, column=4).number_format = _MONEY_FMT
-            ws3.cell(row=r, column=5).number_format = _MONEY_FMT
-        _autowidth(ws3)
+    def summary_sheet(title, agg, key_name):
+        s = wb.create_sheet(title)
+        s.append([key_name, "Позиций", "Отменено", "Выручка, ₽"])
+        for c in s[1]:
+            c.font = Font(bold=True)
+            c.fill = PatternFill("solid", fgColor="DDDDDD")
+        for key, v in sorted(agg.items(), key=lambda kv: str(kv[0]), reverse=True):
+            s.append([key, v["cnt"], v["cancel"], round(v["sum"], 2)])
+        for i, w in enumerate([30, 10, 10, 14], start=1):
+            s.column_dimensions[get_column_letter(i)].width = w
 
-    out_path = Path(out_path)
-    out_path.parent.mkdir(parents=True, exist_ok=True)
+    summary_sheet("По дням", by_day, "Дата")
+    summary_sheet("По артикулам", by_art, "Артикул")
     wb.save(out_path)
     return out_path

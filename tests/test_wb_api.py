@@ -1,96 +1,116 @@
+import json
 from datetime import date
 
 import pytest
 
+from wb_sync import wb_api
 from wb_sync.app_config import AppConfig
-from wb_sync.wb_api import WBClient, chunk_periods, CachedDataMissingError
 
 
 class FakeResponse:
     def __init__(self, payload, status_code=200):
-        self.payload = payload
+        self._payload = payload
         self.status_code = status_code
-        self.text = ""
+        self.text = json.dumps(payload, ensure_ascii=False)
+        self.url = "https://test"
 
     def json(self):
-        return self.payload
+        return self._payload
+
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            raise RuntimeError(f"HTTP {self.status_code}")
 
 
 class FakeSession:
-    """Сессия-заглушка: считает вызовы, пагинацию v3 отдаёт по счётчику."""
-
-    def __init__(self, orders_payload):
+    def __init__(self, responses):
+        self.responses = list(responses)
         self.headers = {}
-        self.v1_calls = 0
-        self.orders_payload = orders_payload
+        self.calls = []
 
-    def request(self, method, url, timeout=None, **kwargs):
-        if "/api/v1/" in url:
-            self.v1_calls += 1
-            return FakeResponse([{"srid": f"s{self.v1_calls}"}], 200)
-        if url.endswith("/api/v3/orders"):
-            nxt = kwargs["json"].get("next", 0)
-            if nxt == 0:
-                return FakeResponse({"orders": self.orders_payload[:2], "next": 2}, 200)
-            return FakeResponse({"orders": self.orders_payload[2:], "next": None}, 200)
-        raise AssertionError(url)
+    def get(self, url, params=None, timeout=None):
+        self.calls.append(("GET", url, params))
+        return self.responses.pop(0)
+
+    def post(self, url, json=None, timeout=None):
+        self.calls.append(("POST", url, json))
+        return self.responses.pop(0)
 
 
-@pytest.fixture
-def cfg(monkeypatch, tmp_path):
-    monkeypatch.setenv("API_TOKEN", "tok")
-    return AppConfig(work_dir=tmp_path)
+def make_config(tmp_path, **kw):
+    return AppConfig(work_dir=str(tmp_path), api_token="tok", **kw)
 
 
 def test_chunk_periods():
-    chunks = list(chunk_periods(date(2026, 10, 1), date(2026, 10, 31)))
-    assert len(chunks) == 2
-    assert chunks[0][0] == date(2026, 10, 1)
-    assert chunks[1][1] == date(2026, 10, 31)
+    chunks = wb_api.chunk_periods(date(2026, 10, 1), date(2026, 11, 30))
+    assert len(chunks) == 3
+    assert chunks[0] == (date(2026, 10, 1), date(2026, 10, 30))
+    assert chunks[1] == (date(2026, 10, 31), date(2026, 11, 29))
+    assert chunks[2] == (date(2026, 11, 30), date(2026, 11, 30))
+    # период в 30 дней (dateFrom/dateTo включительно) -> один кусок
+    assert wb_api.chunk_periods(date(2026, 10, 1), date(2026, 10, 30)) == [
+        (date(2026, 10, 1), date(2026, 10, 30))
+    ]
 
 
-def test_get_orders_paginated_and_cached(cfg):
-    client = WBClient(cfg)
-    fake = FakeSession([])
-    client.session = fake
-    rows = client.get_orders(date(2026, 10, 1), date(2026, 10, 31))
-    assert fake.v1_calls == 2  # два 30-дневных чанка
-    assert len(rows) == 2
-    # Кеш существует
-    cached = client.load_orders(date(2026, 10, 1), date(2026, 10, 31))
-    assert cached == rows
+def test_get_orders_paginated_and_cached(tmp_path):
+    cfg = make_config(tmp_path)
+    session = FakeSession([FakeResponse([{"srid": "1", "finishedPrice": 10000}])])
+    client = wb_api.WBClient(cfg, session=session)
+    rows = client.get_orders(date(2026, 10, 1), date(2026, 10, 30))
+    assert len(rows) == 1
+    assert any(p.name.startswith("wb_orders_2026-10-01_2026-10-30") for p in tmp_path.iterdir())
+    # fetch_data=False -> читаем из кеша, сеть не трогаем
+    cfg2 = make_config(tmp_path)
+    cfg2.fetch_data = False
+    client2 = wb_api.WBClient(cfg2, session=FakeSession([]))
+    assert client2.get_orders(date(2026, 10, 1), date(2026, 10, 30)) == rows
 
 
-def test_cache_without_api(cfg):
-    client = WBClient(cfg)
-    client._save_cache("orders_2026-10-01_2026-10-30", date(2026, 10, 1), date(2026, 10, 30), [{"srid": "x"}])
-    rows = client.load_orders(date(2026, 10, 1), date(2026, 10, 30))
-    assert rows == [{"srid": "x"}]
+def test_cache_missing_raises(tmp_path):
+    cfg = make_config(tmp_path)
+    cfg.fetch_data = False
+    client = wb_api.WBClient(cfg, session=FakeSession([]))
+    with pytest.raises(wb_api.CachedDataMissingError):
+        client.get_orders(date(2026, 10, 1), date(2026, 10, 30))
 
 
-def test_cache_missing_raises(cfg):
-    client = WBClient(cfg)
-    with pytest.raises(CachedDataMissingError):
-        client.load_fbs_orders(date(2026, 10, 1), date(2026, 10, 30))
+def test_retry_on_429(tmp_path):
+    cfg = make_config(tmp_path)
+    session = FakeSession([FakeResponse({}, status_code=429), FakeResponse([])])
+    client = wb_api.WBClient(cfg, session=session)
+    rows = client.get_orders(date(2026, 10, 1), date(2026, 10, 30))
+    assert rows == []
+    assert len(session.calls) == 2
 
 
-def test_v3_pagination(cfg):
-    client = WBClient(cfg)
-    client.session = FakeSession(
-        [{"rid": f"r{i}", "nmId": 100 + i, "price": 2954800,
-          "createdAt": 1761500000000, "statuses": {"isCancel": False, "supplierStatus": "sorted_to_ship"}}
-         for i in range(4)]
-    )
+def test_v3_pagination(tmp_path):
+    cfg = make_config(tmp_path)
+    page1 = {"orders": [{"rid": "r1", "nmId": 1, "price": 100, "createdAt": 1792195200000,
+                          "statuses": {"isCancel": False, "supplierStatus": "delivering"}}],
+             "next": 1}
+    page2 = {"orders": [{"rid": "r2", "nmId": 2, "price": 200, "createdAt": 1792195200000,
+                          "statuses": {"isCancel": True, "supplierStatus": "sold"}}]}
+    session = FakeSession([FakeResponse(page1), FakeResponse(page2)])
+    client = wb_api.WBClient(cfg, session=session)
     rows = client.get_fbs_orders(date(2026, 10, 1), date(2026, 10, 31))
-    assert len(rows) == 4  # 2 + 2 по пагинации через next
-    assert client.normalize_fbs_status(rows[0]) == "Готов к отгрузке"
+    assert [r["rid"] for r in rows] == ["r1", "r2"]
+    # второй вызов был с next=1, дальше — стоп (next отсутствует)
+    assert len(session.calls) == 2
+    assert session.calls[0][2]["next"] == 0
+    assert session.calls[1][2]["next"] == 1
 
 
-def test_normalize_cancel(cfg):
-    client = WBClient(cfg)
-    assert client.normalize_fbs_status({"statuses": {"isCancel": True}}) == "Отменен"
-    assert client.normalize_fbs_status({"statuses": {"supplierStatus": "delivering"}}) == "Доставляется"
+def test_normalize_cancel(tmp_path):
+    cfg = make_config(tmp_path)
+    client = wb_api.WBClient(cfg, session=FakeSession([]))
+    assert client.normalize_status({"statuses": {"isCancel": True}}) == "Отменен"
+    assert client.normalize_status({"statuses": {"isCancel": False, "supplierStatus": "delivering"}}) == "Доставляется"
+    assert client.normalize_status({"statuses": {"isCancel": False, "supplierStatus": "awaiting_deliver"}}) == "Готов к отгрузке"
 
 
-def test_rub_from_kopecks():
-    assert WBClient.rub_from_kopecks(2954800) == 29548.0
+def test_rub_from_kopecks(tmp_path):
+    cfg = make_config(tmp_path)
+    session = FakeSession([FakeResponse([{"srid": "1", "finishedPrice": 2954800}])])
+    client = wb_api.WBClient(cfg, session=session)
+    assert client.get_orders(date(2026, 10, 1), date(2026, 10, 30))[0]["finishedPrice"] == 2954800

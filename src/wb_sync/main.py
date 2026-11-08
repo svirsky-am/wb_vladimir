@@ -1,47 +1,70 @@
-"""CLI: wb-sync sync|report|all|serve"""
+"""CLI wb-sync."""
+from __future__ import annotations
 
 import argparse
-import sys
-from datetime import date, timedelta
+import asyncio
+from datetime import date
 
 from .app_config import AppConfig
+from .core import sync_cards, sync_data
+from .db import get_engine, load_fbs_orders, load_orders
 from .logging_setup import setup_logging
-from .core import sync_data, build_registry_report, default_window
-from .service import serve
+from .reports import build_registry_rows, build_registry_xlsx
+from .wb_api import WBClient
 
 
-def _parse_date(value: str | None) -> date | None:
-    return date.fromisoformat(value) if value else None
+def main():
+    parser = argparse.ArgumentParser(prog="wb-sync")
+    sub = parser.add_subparsers(dest="cmd", required=True)
 
+    p_sync = sub.add_parser("sync")
+    p_sync.add_argument("--date-from", required=True)
+    p_sync.add_argument("--date-to", required=True)
+    p_sync.add_argument("--no-fetch", action="store_true")
 
-def main(argv=None) -> int:
-    parser = argparse.ArgumentParser(prog="wb-sync", description=__doc__)
-    parser.add_argument("command", choices=["sync", "report", "all", "serve"])
-    parser.add_argument("--date-from")
-    parser.add_argument("--date-to")
-    parser.add_argument("--out")
-    parser.add_argument("--no-fetch", action="store_true", help="работать по кешу в work_dir")
-    args = parser.parse_args(argv)
+    p_cards = sub.add_parser("cards")
+    p_cards.add_argument("--no-fetch", action="store_true")
 
-    cfg = AppConfig(fetch_data=not args.no_fetch)
-    setup_logging(cfg)
+    p_report = sub.add_parser("report")
+    p_report.add_argument("--date-from", required=True)
+    p_report.add_argument("--date-to", required=True)
+    p_report.add_argument("--out", default="work_dir/registry.xlsx")
 
-    if args.command == "serve":
-        serve(cfg)
-        return 0
+    p_sheets = sub.add_parser("upload-sheets")
+    p_sheets.add_argument("--file", required=True)
+    p_sheets.add_argument("--worksheet", default="Реестр")
 
-    date_from, date_to = _parse_date(args.date_from), _parse_date(args.date_to)
-    if args.command in ("sync", "all"):
-        if date_from is None or date_to is None:
-            date_from, date_to = default_window(cfg)
-        sync_data(cfg, date_from=date_from, date_to=date_to)
-    if args.command in ("report", "all"):
-        if date_from is None or date_to is None:
-            date_from, date_to = default_window(cfg)
-        path = build_registry_report(cfg, date_from, date_to, out_path=args.out)
-        print(f"Отчёт: {path}")
-    return 0
+    sub.add_parser("serve")
+
+    args = parser.parse_args()
+    config = AppConfig()
+    setup_logging(config.work_dir)
+
+    if args.cmd == "serve":
+        from .service import run_service
+        asyncio.run(run_service(config))
+        return
+
+    if args.no_fetch:
+        config.fetch_data = False
+
+    client = WBClient(config)
+    engine = get_engine(config)
+
+    if args.cmd == "sync":
+        print(sync_data(config, engine, client))
+    elif args.cmd == "cards":
+        print(sync_cards(config, engine, client))
+    elif args.cmd == "report":
+        d1, d2 = date.fromisoformat(args.date_from), date.fromisoformat(args.date_to)
+        fbs = {r["srid"]: r for r in load_fbs_orders(engine, d1, d2)}
+        rows = build_registry_rows(load_orders(engine, d1, d2), fbs)
+        out = build_registry_xlsx(rows, d1, d2, args.out)
+        print(f"Отчёт: {out} ({len(rows)} строк)")
+    elif args.cmd == "upload-sheets":
+        from .sheets import upload_xlsx_to_sheets
+        print(upload_xlsx_to_sheets(config, args.file, args.worksheet))
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    main()
