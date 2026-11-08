@@ -13,9 +13,6 @@ def fetch_all(client: WBClient, date_from: date, date_to: date) -> dict:
     return client.fetch_parallel({
         "orders": lambda: client.get_orders(date_from, date_to),
         "sales": lambda: client.get_sales(date_from, date_to),
-        "incomes": lambda: client.get_incomes(date_from, date_to),
-        "stocks": lambda: client.get_stocks(),
-        "warehouses": lambda: client.get_warehouses(),
         "v3_orders": lambda: client.get_v3_orders(date_from, date_to),
         "cards": lambda: client.get_cards(),
     })
