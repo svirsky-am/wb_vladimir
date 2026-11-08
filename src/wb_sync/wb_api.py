@@ -105,13 +105,18 @@ class WBClient:
                     return
             time.sleep(min(wait, 0.5))
 
+    @staticmethod
+    def _safe_label(label: str) -> str:
+        """Безопасное для file-system имя из label."""
+        return label.replace("/", "__").replace(" ", "_").replace("\t", "_").strip(" .-_")
+
     def _save_response(self, label: str, payload) -> None:
         """Сырой ответ -> work_dir/responses/<label>_<timestamp>.json"""
         try:
             d = self.config.work_dir / "responses"
             d.mkdir(parents=True, exist_ok=True)
             ts = datetime.now().strftime("%Y%m%dT%H%M%S")
-            path = d / f"{label}_{ts}.json"
+            path = d / f"{WBClient._safe_label(label)}_{ts}.json"
             with open(path, "w", encoding="utf-8") as f:
                 json.dump(payload, f, ensure_ascii=False, indent=2, default=str)
         except Exception:  # сохранение ответа не должно ломать выгрузку
@@ -130,10 +135,13 @@ class WBClient:
                 resp = self.session.request(method, url, params=params, json=json_body, timeout=60)
                 elapsed = time.monotonic() - started
                 if resp.status_code == 200:
+                    result = resp.json()
                     logger.info("%s → 200 (%.1f КБ, %.2f с)", label, len(resp.content) / 1024, elapsed)
-                    return resp.json()
+                    self._save_response(label, result)
+                    return result
                 if resp.status_code == 429 or resp.status_code >= 500:
                     logger.info("Попытка %d/%d %s — HTTP %d (%.2f с)", attempt, total, label, resp.status_code, elapsed)
+                    self._save_response(label, resp.json())
                     retry_after = resp.headers.get("Retry-After")
                     delay = float(retry_after) if (retry_after or "").isdigit() else self.config.retry_base_delay * (2 ** (attempt - 1))
                     logger.info("HTTP %d: пауза %.0f с перед попыткой %d/%d", resp.status_code, delay, attempt + 1, total)
@@ -143,8 +151,12 @@ class WBClient:
                 resp.raise_for_status()
             except requests.HTTPError:
                 logger.error("Запрос не удался окончательно: %s — HTTP %d", label, resp.status_code)
+                try:
+                    self._save_response(label, resp.json())
+                except Exception:
+                    pass
                 raise
-            except requests.RequestException as exc:
+            except (requests.RequestException, OSError) as exc:
                 logger.info("Попытка %d/%d %s — сетевая ошибка: %s", attempt, total, label, exc)
                 last_err = str(exc)
                 delay = self.config.retry_base_delay * (2 ** (attempt - 1))
